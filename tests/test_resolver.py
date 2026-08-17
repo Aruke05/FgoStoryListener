@@ -1524,7 +1524,7 @@ class ResolverTests(unittest.TestCase):
 
     def test_explanation_web_search_is_explicit_and_precedes_exec(self) -> None:
         worker = CodexExplanationWorker(
-            object(), RuntimeConfig(explanation_web_search=True), 7,
+            object(), RuntimeConfig(codex_path="codex", explanation_web_search=True), 7,
             __import__("queue").Queue(),
         )
         command = worker._command(Path("schema.json"), Path("out.json"), Path("runtime"))
@@ -1533,7 +1533,7 @@ class ResolverTests(unittest.TestCase):
         self.assertIn("read-only", command)
 
         offline = CodexExplanationWorker(
-            object(), RuntimeConfig(explanation_web_search=False), 7,
+            object(), RuntimeConfig(codex_path="codex", explanation_web_search=False), 7,
             __import__("queue").Queue(),
         )
         self.assertNotIn(
