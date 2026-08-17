@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local build toolchain and outputs
+.tools/
+build/
+dist-*/
+*.spec.bak
+
+# Release archives are published through GitHub Releases, not source control
+release/*.zip
+release/*.7z
+release/*.exe
+
+# Local smoke/benchmark scratch directories
+.analysis_*/
+
+# Local application state and databases
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Editor / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local Codex maintenance instructions
+/AGENTS.md
+
+# Manually retained rollback copies
+*.rollback-backup

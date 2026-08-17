@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "policy": "curated-source-backed-only",
+  "terms": [
+    {"ja": "カルデア", "zh": "迦勒底", "scope": "global"},
+    {"ja": "サーヴァント", "zh": "从者", "scope": "global"},
+    {"ja": "マスター", "zh": "御主", "scope": "global"},
+    {"ja": "令呪", "zh": "令咒", "scope": "global"},
+    {"ja": "宝具", "zh": "宝具", "scope": "global"},
+    {"ja": "霊基", "zh": "灵基", "scope": "global"},
+    {"ja": "レイシフト", "zh": "灵子转移", "scope": "global"},
+    {"ja": "特異点", "zh": "特异点", "scope": "global"},
+    {"ja": "異聞帯", "zh": "异闻带", "scope": "global"},
+    {"ja": "人理", "zh": "人理", "scope": "global"},
+    {"ja": "グランドオーダー", "zh": "冠位指定（Grand Order）", "scope": "global"},
+    {"ja": "マシュ・キリエライト", "zh": "玛修·基列莱特", "scope": "character"},
+    {"ja": "マシュ", "zh": "玛修", "scope": "character"},
+    {"ja": "オルガマリー・アニムスフィア", "zh": "奥尔加玛丽·阿尼姆斯菲亚", "scope": "character"},
+    {"ja": "オルガマリー", "zh": "奥尔加玛丽", "scope": "character"},
+    {"ja": "フォウ", "zh": "芙芙", "scope": "character"},
+    {"ja": "ダンテ", "zh": "但丁", "scope": "character"},
+    {"ja": "耀星のハサン", "zh": "耀星哈桑", "scope": "character"},
+    {"ja": "ハサン・サッバーハ", "zh": "哈桑·萨巴赫", "scope": "character"}
+  ]
+}

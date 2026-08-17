@@ -1,0 +1,9 @@
+* text=auto
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.sh text eol=lf
+
+# Runtime binaries exceed normal GitHub file-size recommendations.
+runtime/frida-server-* filter=lfs diff=lfs merge=lfs -text
+runtime/frida-gadget-* filter=lfs diff=lfs merge=lfs -text
+

@@ -1,0 +1,13 @@
+FGO 剧情文本监听器 v2.6.0（无 OCR 版）
+
+- 已从运行链路完全移除截图和 Windows OCR。
+- 安装包不再包含 ocr_helper.ps1。
+- 原文仅来自 IL2CPP managed string、ScriptManager 完整剧情数组和游戏自身 ScriptBackLog。
+- 可确定的文本直接规范化并入库；不确定的实时片段直接丢弃，等待完整剧情或 LOG 补齐，绝不根据画面猜字。
+- 启动时的当前句也从现有 ScriptManager、消息标签和游戏 LOG 读取，不进行 screencap。
+- 保留 v2.5.1 的 [#整段可见文字] 修复、跨通道去重和旧数据库自动修复。
+
+验证要求：安装包中不得出现 OCR helper，运行处理器源码中不得调用 screencap、
+WindowsJapaneseOcr、capture_screen 或 ScreenOCR 输出通道。
+
+29 项回归测试全部通过。

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["meaning", "prior_context", "context", "subtext", "notes", "web_sources", "uncertainty"],
+  "properties": {
+    "meaning": {"type": "string"},
+    "prior_context": {"type": "string"},
+    "context": {"type": "string"},
+    "subtext": {"type": "string"},
+    "notes": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "web_sources": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "url", "summary"],
+        "properties": {
+          "title": {"type": "string"},
+          "url": {"type": "string"},
+          "summary": {"type": "string"}
+        }
+      }
+    },
+    "uncertainty": {"type": "string"}
+  }
+}
