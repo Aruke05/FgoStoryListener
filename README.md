@@ -5,7 +5,14 @@
 实时读取日服 FGO 的剧情台词、人物名、选项与游戏 LOG，使用本机已登录的
 `codex-cli` 生成中文译文，并保存为可筛选、复制和导出的双语历史记录。
 
-当前版本：**v2.9.7**
+当前版本：**v2.9.8**
+
+### v2.9.8 CLI 自动发现修复
+
+- 扫描 PATH 中的 Codex 和 Windows 桌面版的已知安装目录，实际执行 `--version`，按版本选择可正常启动的新版；不再无条件优先选旧的 `codex.cmd`。
+- 不硬编码桌面版的版本目录；安装变化时重新探测，正常翻译批次复用探测结果。显式填写的 CLI 路径仍优先。
+- GPT-6 是否出现以选中 CLI 的模型目录为准，不向列表塞固定型号。
+- 按用户要求，新版验证成功后删除旧安装目录、旧压缩包和回滚备份，只保留最新版；不触碰剧情数据库。
 
 ### v2.9.7 模型目录修复
 
@@ -83,7 +90,7 @@ python .\fgo_story_listener.py
 # 单元测试
 python -m unittest discover -s tests -v
 
-# 生成 dist-v2.9.7\FgoStoryListener
+# 生成 dist-v2.9.8\FgoStoryListener
 .\build.ps1
 ```
 

@@ -1,1 +1,0 @@
-cc6cdd50529f7fc18dc8a9f9a965f30903605834e68078817f84ad66367b17f3  FgoStoryListener-v2.7.0-win64.zip

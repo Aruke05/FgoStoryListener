@@ -18,6 +18,7 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 import unicodedata
@@ -34,7 +35,7 @@ except ImportError as exc:  # pragma: no cover - packaged builds include Frida
 
 
 APP_NAME = "FGO 剧情文本监听器"
-APP_VERSION = "2.9.7"
+APP_VERSION = "2.9.8"
 PACKAGE = "com.aniplex.fategrandorder"
 GADGET_PORT = 27043
 SERVER_PORT = 27042
@@ -484,14 +485,8 @@ def fast_mode_effective(config: "RuntimeConfig", preloaded: bool = False) -> boo
     return fast_mode_for(config.translation_model, config.translation_fast_mode, config.codex_path)
 
 
-def _codex_command(configured: str = "") -> list[str]:
-    """Return a shell-free command line for the locally installed Codex CLI."""
-    candidate = configured.strip() or shutil.which("codex.cmd") or shutil.which("codex") or ""
-    if not candidate:
-        common = Path(r"C:\nvm4w\nodejs\codex.cmd")
-        candidate = str(common) if common.is_file() else ""
-    if not candidate:
-        raise RuntimeError("未找到 codex-cli。请先安装并执行 codex login。")
+def _codex_launcher(candidate: str) -> list[str]:
+    """Normalize npm launchers without replacing an explicit user choice."""
     path = Path(candidate)
     if os.name == "nt" and path.suffix.lower() in {".cmd", ".bat", ".ps1"}:
         base = path.parent
@@ -503,6 +498,100 @@ def _codex_command(configured: str = "") -> list[str]:
             return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(path)]
         return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(path)]
     return [str(path)]
+
+
+def _codex_candidates() -> list[Path]:
+    """Inspect only PATH and the known desktop CLI install directory."""
+    candidates: list[Path] = []
+    names = ("codex.exe", "codex.cmd", "codex.ps1", "codex")
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        directory = directory.strip().strip('"')
+        if directory:
+            candidates.extend(Path(directory) / name for name in names)
+    if os.name == "nt":
+        local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        desktop = local / "OpenAI" / "Codex" / "bin"
+        try:
+            candidates.extend(sorted(desktop.glob("*/codex.exe")))
+        except OSError:
+            pass
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            key = os.path.normcase(str(path.absolute()))
+            if key not in seen and path.is_file():
+                seen.add(key)
+                result.append(path.absolute())
+        except OSError:
+            continue
+    return result
+
+
+@lru_cache(maxsize=8)
+def _select_codex_command(
+    candidates: tuple[tuple[tuple[str, ...], tuple[tuple[str, int, int], ...]], ...],
+) -> tuple[str, ...]:
+    """Probe once per installation snapshot; never spawn probes for every batch."""
+    working = []
+    failures = []
+    for command, _signature in candidates:
+        try:
+            result = subprocess.run(
+                [*command, "--version"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=3,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            match = re.search(r"\bcodex-cli\s+(\d+)\.(\d+)\.(\d+)(?:-([\w.-]+))?", result.stdout)
+            if result.returncode != 0 or not match:
+                raise ValueError("无法识别 CLI 版本")
+            prerelease = match.group(4)
+            suffix = tuple((0, int(p)) if p.isdigit() else (1, p)
+                           for p in (prerelease or "").split("."))
+            version = (*map(int, match.group(1, 2, 3)), prerelease is None, suffix)
+            working.append((version, command))
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            failures.append(f"{command[0]}: {exc}")
+    if not working:
+        raise RuntimeError("未找到可运行的 Codex CLI，请安装或在设置中指定路径。" + "；".join(failures))
+    return max(working, key=lambda entry: entry[0])[1]
+
+
+def _codex_install_signature(command: tuple[str, ...]) -> tuple[tuple[str, int, int], ...]:
+    paths = [Path(arg) for arg in command if Path(arg).is_file()]
+    for script in list(paths):
+        if script.name != "codex.js":
+            continue
+        package = script.resolve().parent.parent
+        paths.append(package / "package.json")
+        # npm can replace only the native optional dependency, leaving its JS
+        # launcher unchanged. Include both bundled and resolved-package layouts.
+        paths.extend(package.glob("vendor/*/bin/codex*"))
+        for scope in (package.parent, package / "node_modules" / "@openai"):
+            paths.extend(scope.glob("codex-*/package.json"))
+            paths.extend(scope.glob("codex-*/vendor/*/bin/codex*"))
+    return tuple((str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+                 for path in sorted(set(paths)) if path.is_file()
+                 for stat in [path.stat()])
+
+
+def _codex_command(configured: str = "") -> list[str]:
+    """Honor explicit paths; otherwise use the newest runnable local CLI."""
+    if configured.strip():
+        return _codex_launcher(configured.strip())
+    candidates = []
+    seen: set[tuple[str, ...]] = set()
+    for path in _codex_candidates():
+        command = tuple(_codex_launcher(str(path)))
+        if command in seen:
+            continue
+        seen.add(command)
+        try:
+            signature = _codex_install_signature(command)
+        except OSError:
+            continue
+        candidates.append((command, signature))
+    return list(_select_codex_command(tuple(candidates)))
 
 
 class HistoryStore:
