@@ -623,7 +623,7 @@ class ResolverTests(unittest.TestCase):
             self.assertEqual(loaded.translation_engine, "app-server")
             self.assertFalse(loaded.pretranslate_scenario)
             models = available_codex_models()
-            self.assertEqual(models[0], "gpt-5.6-terra")
+            self.assertEqual(models, ["custom-fgo-model", "gpt-5.5"])
             self.assertIn("custom-fgo-model", models)
             self.assertEqual(codex_fast_models(), {"gpt-5.5"})
             self.assertTrue(fast_mode_effective(RuntimeConfig(translation_model="gpt-5.5")))
@@ -631,7 +631,7 @@ class ResolverTests(unittest.TestCase):
                 fast_mode_effective(RuntimeConfig(translation_model="custom-fgo-model"))
             )
 
-    def test_newer_codex_model_error_retries_with_compatible_default(self) -> None:
+    def test_newer_codex_model_error_preserves_selected_model(self) -> None:
         class RejectingClient:
             def translate(self, *args, **kwargs):
                 raise RuntimeError(
@@ -660,24 +660,24 @@ class ResolverTests(unittest.TestCase):
         ):
             store = HistoryStore(Path(temp) / "history.db")
             config = RuntimeConfig(translation_model="gpt-5.6-sol")
+            config.save()
             events = __import__("queue").Queue()
             worker = CodexTranslationWorker(store, config, events)
             worker._app_server = RejectingClient()
             with patch(
                 "fgo_story_listener.CodexAppServerClient", CompatibleClient
             ), patch.object(worker, "_invoke_exec") as exec_fallback:
-                result = worker._invoke(
-                    "第4节",
-                    '{"lines_to_translate":[{"id":1,"ja":"こんにちは。"}]}',
-                )
-            self.assertEqual(config.translation_model, "gpt-5.5")
-            self.assertEqual(result["translations"][0]["zh"], "你好。")
+                with self.assertRaisesRegex(RuntimeError, "升级.*Codex"):
+                    worker._invoke(
+                        "第4节",
+                        '{"lines_to_translate":[{"id":1,"ja":"こんにちは。"}]}',
+                    )
+            self.assertEqual(config.translation_model, "gpt-5.6-sol")
             exec_fallback.assert_not_called()
-            self.assertIn("已自动切换为 gpt-5.5", events.get_nowait()["text"])
-            self.assertEqual(RuntimeConfig.load().translation_model, "gpt-5.5")
+            self.assertEqual(RuntimeConfig.load().translation_model, "gpt-5.6-sol")
             store.close()
 
-    def test_old_single_sol_profile_migrates_to_split_live_and_preload_profiles(self) -> None:
+    def test_old_single_profile_preserves_explicit_model_and_reasoning(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict(
             os.environ, {"LOCALAPPDATA": temp}
         ):
@@ -690,8 +690,8 @@ class ResolverTests(unittest.TestCase):
                 encoding="utf-8",
             )
             loaded = RuntimeConfig.load()
-            self.assertEqual(loaded.translation_model, "gpt-5.6-terra")
-            self.assertEqual(loaded.translation_reasoning, "low")
+            self.assertEqual(loaded.translation_model, "gpt-5.6-sol")
+            self.assertEqual(loaded.translation_reasoning, "high")
             self.assertEqual(loaded.preload_translation_model, "gpt-5.6-sol")
             self.assertEqual(loaded.preload_translation_reasoning, "high")
 

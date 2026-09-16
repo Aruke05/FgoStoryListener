@@ -34,13 +34,12 @@ except ImportError as exc:  # pragma: no cover - packaged builds include Frida
 
 
 APP_NAME = "FGO 剧情文本监听器"
-APP_VERSION = "2.9.5"
+APP_VERSION = "2.9.7"
 PACKAGE = "com.aniplex.fategrandorder"
 GADGET_PORT = 27043
 SERVER_PORT = 27042
 DEFAULT_TRANSLATION_MODEL = "gpt-5.6-terra"
 DEFAULT_PRELOAD_TRANSLATION_MODEL = "gpt-5.6-sol"
-COMPATIBLE_TRANSLATION_MODEL = "gpt-5.5"
 WHOLE_STAGE_MAX_ROWS = 256
 WHOLE_STAGE_MAX_JAPANESE_CHARS = 12000
 
@@ -375,49 +374,114 @@ def format_bilingual_entry(speaker: str, text: str, translation: str = "") -> st
     return f"{source}\n译：{translated}" if translated else source
 
 
-def available_codex_models() -> list[str]:
-    """Read Codex' own model cache without changing the user's global config."""
-    preferred = [DEFAULT_TRANSLATION_MODEL, "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.4"]
-    path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "models_cache.json"
-    discovered: list[str] = []
+_MODEL_CATALOGS: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+
+def _model_catalog_key(configured: str = "") -> tuple[str, str]:
+    return (str(Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))), configured.strip())
+
+
+def _visible_models(items: Any) -> list[dict[str, Any]]:
+    models: dict[str, dict[str, Any]] = {}
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("hidden") or item.get("visibility") == "hide":
+            continue
+        slug = item.get("model", item.get("slug"))
+        if isinstance(slug, str) and slug.strip():
+            models.setdefault(slug.strip(), {**item, "slug": slug.strip()})
+    return list(models.values())
+
+
+def _codex_model_catalog(configured: str = "") -> list[dict[str, Any]]:
+    key = _model_catalog_key(configured)
+    if key in _MODEL_CATALOGS:
+        return _MODEL_CATALOGS[key]
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        for item in value.get("models", []):
-            slug = str(item.get("slug", "")).strip()
-            if slug and str(item.get("visibility", "list")) != "hide":
-                discovered.append(slug)
+        value = json.loads((Path(key[0]) / "models_cache.json").read_text(encoding="utf-8"))
+        return _visible_models(value.get("models")) if isinstance(value, dict) else []
     except (OSError, ValueError, TypeError):
-        pass
-    return list(dict.fromkeys([*preferred, *discovered]))
+        return []
 
 
-def codex_fast_models() -> set[str]:
-    """Models whose local Codex catalog exposes the priority/Fast tier."""
-    path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "models_cache.json"
-    supported: set[str] = set()
+def available_codex_models(configured: str = "") -> list[str]:
+    """Last queried catalog, or explicitly unverified local cache; no invented names."""
+    return [item["slug"] for item in _codex_model_catalog(configured)]
+
+
+def codex_fast_models(configured: str = "") -> set[str]:
+    supported = set()
+    for item in _codex_model_catalog(configured):
+        tiers = item.get("serviceTiers", item.get("service_tiers"))
+        if isinstance(tiers, list) and any(
+            isinstance(tier, dict) and tier.get("id") == "priority" for tier in tiers
+        ):
+            supported.add(item["slug"])
+    return supported
+
+
+def codex_reasoning_efforts(model: str, configured: str = "") -> list[str]:
+    for item in _codex_model_catalog(configured):
+        if item["slug"] == model:
+            efforts = item.get("supportedReasoningEfforts", item.get("supported_reasoning_levels")) or []
+            if not isinstance(efforts, list):
+                return []
+            return list(dict.fromkeys(
+                effort for entry in efforts if isinstance(entry, dict)
+                for effort in [entry.get("reasoningEffort", entry.get("effort"))]
+                if isinstance(effort, str) and effort
+            ))
+    return []
+
+
+def refresh_codex_models(config: "RuntimeConfig") -> tuple[list[str], str]:
+    """Query a separate short-lived server, never the active translation channel."""
+    client = CodexAppServerClient(config)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        for item in value.get("models", []):
-            tiers = item.get("service_tiers", [])
-            if any(str(tier.get("id", "")) == "priority" for tier in tiers):
-                slug = str(item.get("slug", "")).strip()
-                if slug:
-                    supported.add(slug)
-    except (OSError, ValueError, TypeError):
-        pass
-    return supported or {"gpt-5.5", "gpt-5.4"}
+        client.start()
+        items: list[dict[str, Any]] = []
+        params: dict[str, Any] = {"limit": 100, "includeHidden": False}
+        seen: set[str] = set()
+        for _ in range(100):
+            response = client._request("model/list", params, timeout=15)
+            if "error" in response:
+                raise RuntimeError(str(response["error"]))
+            result = response.get("result")
+            if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                raise ValueError("模型目录格式无效")
+            items.extend(result["data"])
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+            if not isinstance(cursor, str) or cursor in seen:
+                raise ValueError("模型目录分页游标重复或无效")
+            seen.add(cursor)
+            params = {**params, "cursor": cursor}
+        else:
+            raise ValueError("模型目录分页超出限制")
+        catalog = _visible_models(items)
+        if not catalog:
+            raise ValueError("Codex 未返回可见模型")
+        _MODEL_CATALOGS[_model_catalog_key(config.codex_path)] = catalog
+        return available_codex_models(config.codex_path), (
+            f"已查询 Codex model/list · {len(catalog)} 个模型 · {datetime.now():%H:%M:%S}"
+        )
+    except Exception as exc:
+        names = available_codex_models(config.codex_path)
+        return names, f"刷新失败；{'使用缓存（未验证最新）' if names else '无可用缓存，可手动填写模型'}：{exc}"
+    finally:
+        client.close()
 
 
-def fast_mode_for(model: str, enabled: bool) -> bool:
-    return bool(enabled) and str(model) in codex_fast_models()
+def fast_mode_for(model: str, enabled: bool, configured: str = "") -> bool:
+    return bool(enabled) and str(model) in codex_fast_models(configured)
 
 
 def fast_mode_effective(config: "RuntimeConfig", preloaded: bool = False) -> bool:
     if preloaded:
         return fast_mode_for(
-            config.preload_translation_model, config.preload_translation_fast_mode
+            config.preload_translation_model, config.preload_translation_fast_mode, config.codex_path
         )
-    return fast_mode_for(config.translation_model, config.translation_fast_mode)
+    return fast_mode_for(config.translation_model, config.translation_fast_mode, config.codex_path)
 
 
 def _codex_command(configured: str = "") -> list[str]:
@@ -2113,10 +2177,7 @@ class RuntimeConfig:
             return cls()
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
-            # v2.8 splits the former single profile. Existing installations used
-            # Sol for every line; migrate them to the new low-latency live
-            # profile while keeping Sol/high for whole-stage pretranslation.
-            split_profiles = "preload_translation_model" in value
+            # Preserve explicit choices even in configs predating split profiles.
             debounce_default = 120
             debounce_value = (
                 value.get("translation_debounce_ms", debounce_default)
@@ -2130,11 +2191,9 @@ class RuntimeConfig:
                 translation_enabled=bool(value.get("translation_enabled", True)),
                 translation_model=str(
                     value.get("translation_model", DEFAULT_TRANSLATION_MODEL)
-                    if split_profiles else DEFAULT_TRANSLATION_MODEL
                 ),
                 translation_reasoning=str(
                     value.get("translation_reasoning", "low")
-                    if split_profiles else "low"
                 ),
                 preload_translation_model=str(
                     value.get(
@@ -2872,60 +2931,12 @@ class CodexTranslationWorker(threading.Thread):
         except TranslationSuperseded:
             raise
         except Exception as fast_error:
-            # A remotely advertised model can still be rejected by an older
-            # local Codex protocol implementation. This is not a translation
-            # failure: retry the same batch with the known-compatible default
-            # and persist that choice so every queued preload is not failed in
-            # succession with the same 400 response.
-            if (
-                not is_preload
-                and
-                "requires a newer version of Codex" in str(fast_error)
-                and self.config.translation_model != COMPATIBLE_TRANSLATION_MODEL
-            ):
-                rejected_model = self.config.translation_model
+            if "requires a newer version of Codex" in str(fast_error):
                 self._app_server.close()
-                self.config.translation_model = COMPATIBLE_TRANSLATION_MODEL
-                try:
-                    self.config.save()
-                except OSError:
-                    pass
-                self._app_server = CodexAppServerClient(self.config)
-                self._fast_mode_failed = False
-                self.events.put(
-                    {
-                        "type": "translation_status",
-                        "text": (
-                            f"本机 Codex CLI 不支持 {rejected_model}，"
-                            f"已自动切换为 {COMPATIBLE_TRANSLATION_MODEL} 并重试当前批次"
-                        ),
-                    }
-                )
-                try:
-                    return self._app_server.translate(
-                        quest,
-                        prompt,
-                        schema,
-                        runtime,
-                        cancel_event=cancel_event,
-                        partial_callback=partial_callback,
-                        preview_callback=preview_callback,
-                    )
-                except TranslationSuperseded:
-                    raise
-                except Exception as compatible_error:
-                    self._app_server.close()
-                    self._fast_mode_failed = True
-                    self.events.put(
-                        {
-                            "type": "translation_status",
-                            "text": (
-                                "兼容模型常驻模式异常，当前批次自动改用兼容进程模式："
-                                f"{compatible_error}"
-                            ),
-                        }
-                    )
-                    return self._invoke_exec(fallback_prompt or prompt)
+                raise RuntimeError(
+                    "请升级本机 Codex CLI 后重试，或在设置中手动选择其他模型；"
+                    f"已保留当前模型和待翻译原文。原始错误：{fast_error}"
+                ) from fast_error
             self._app_server.close()
             self._fast_mode_failed = True
             if self.stop_event.is_set():
@@ -5610,22 +5621,23 @@ class Application(tk.Tk):
         ttk.Label(live_frame, text="模型：").grid(
             row=0, column=0, sticky="e", padx=(0, 8), pady=5
         )
-        ttk.Combobox(
+        live_model_box = ttk.Combobox(
             live_frame,
             textvariable=live_model,
-            values=available_codex_models(),
+            values=available_codex_models(self.config_data.codex_path),
             width=34,
-        ).grid(row=0, column=1, sticky="ew", pady=5)
+        )
+        live_model_box.grid(row=0, column=1, sticky="ew", pady=5)
         ttk.Label(live_frame, text="推理强度：").grid(
             row=1, column=0, sticky="e", padx=(0, 8), pady=5
         )
-        ttk.Combobox(
+        live_reasoning_box = ttk.Combobox(
             live_frame,
             textvariable=live_reasoning,
-            values=("low", "medium", "high", "xhigh"),
-            state="readonly",
+            values=codex_reasoning_efforts(live_model.get(), self.config_data.codex_path),
             width=31,
-        ).grid(row=1, column=1, sticky="w", pady=5)
+        )
+        live_reasoning_box.grid(row=1, column=1, sticky="w", pady=5)
         ttk.Label(live_frame, text="运行模式：").grid(
             row=2, column=0, sticky="e", padx=(0, 8), pady=5
         )
@@ -5643,7 +5655,7 @@ class Application(tk.Tk):
         ).grid(row=3, column=1, sticky="w", pady=5)
         ttk.Label(
             live_frame,
-            text="推荐：gpt-5.6-terra / low / Fast。常驻会话优先响应刚出现的选项。",
+            text="模型目录自动查询；保留当前选择。常驻会话优先响应刚出现的选项。",
             foreground=UI_SECONDARY,
         ).grid(row=4, column=1, sticky="w", pady=(2, 4))
         live_frame.columnconfigure(1, weight=1)
@@ -5655,25 +5667,26 @@ class Application(tk.Tk):
         ttk.Label(preload_frame, text="模型：").grid(
             row=0, column=0, sticky="e", padx=(0, 8), pady=5
         )
-        ttk.Combobox(
+        preload_model_box = ttk.Combobox(
             preload_frame,
             textvariable=preload_model,
-            values=available_codex_models(),
+            values=available_codex_models(self.config_data.codex_path),
             width=34,
-        ).grid(row=0, column=1, sticky="ew", pady=5)
+        )
+        preload_model_box.grid(row=0, column=1, sticky="ew", pady=5)
         ttk.Label(preload_frame, text="推理强度：").grid(
             row=1, column=0, sticky="e", padx=(0, 8), pady=5
         )
-        ttk.Combobox(
+        preload_reasoning_box = ttk.Combobox(
             preload_frame,
             textvariable=preload_reasoning,
-            values=("low", "medium", "high", "xhigh", "max"),
-            state="readonly",
+            values=codex_reasoning_efforts(preload_model.get(), self.config_data.codex_path),
             width=31,
-        ).grid(row=1, column=1, sticky="w", pady=5)
+        )
+        preload_reasoning_box.grid(row=1, column=1, sticky="w", pady=5)
         ttk.Label(
             preload_frame,
-            text="推荐：gpt-5.6-sol / high。与实时常驻会话完全隔离。",
+            text="推理强度随模型目录更新；与实时常驻会话完全隔离。",
             foreground=UI_SECONDARY,
         ).grid(row=2, column=1, sticky="w", pady=(2, 4))
         ttk.Checkbutton(
@@ -5724,6 +5737,65 @@ class Application(tk.Tk):
         ).grid(row=3, column=1, sticky="w")
         common_frame.columnconfigure(1, weight=1)
 
+        catalog_status = tk.StringVar(value="模型目录尚未查询；当前显示缓存。")
+        ttk.Label(common_frame, textvariable=catalog_status, wraplength=480).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        refresh_results: queue.Queue[tuple[str, list[str], str]] = queue.Queue()
+        refreshing = False
+
+        def update_capabilities(*_args: Any) -> None:
+            configured = codex_path.get().strip()
+            live_reasoning_box.configure(values=codex_reasoning_efforts(live_model.get(), configured))
+            preload_reasoning_box.configure(values=codex_reasoning_efforts(preload_model.get(), configured))
+
+        def refresh_models() -> None:
+            nonlocal refreshing
+            if refreshing:
+                return
+            refreshing = True
+            refresh_button.configure(state="disabled")
+            catalog_status.set("正在查询 Codex model/list…（不影响剧情捕获）")
+            configured = codex_path.get().strip()
+            query_config = RuntimeConfig(codex_path=configured)
+
+            def query() -> None:
+                names, status = refresh_codex_models(query_config)
+                refresh_results.put((configured, names, status))
+
+            threading.Thread(target=query, name="CodexModelCatalog", daemon=True).start()
+
+        def poll_models() -> None:
+            nonlocal refreshing
+            if not dialog.winfo_exists():
+                return
+            try:
+                configured, names, status = refresh_results.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                refreshing = False
+                refresh_button.configure(state="normal")
+                if configured == codex_path.get().strip():
+                    live_model_box.configure(values=names)
+                    preload_model_box.configure(values=names)
+                    update_capabilities()
+                    missing = [name for name in (live_model.get(), preload_model.get()) if name not in names]
+                    if missing:
+                        status += "；当前选择未在目录中，已保留，可手动修改。"
+                    catalog_status.set(status)
+                else:
+                    refresh_models()
+            self.after(100, poll_models)
+
+        refresh_button = ttk.Button(common_frame, text="刷新模型列表", command=refresh_models)
+        refresh_button.grid(row=5, column=1, sticky="w", pady=(6, 0))
+        live_model.trace_add("write", update_capabilities)
+        preload_model.trace_add("write", update_capabilities)
+        codex_path.trace_add("write", lambda *_: catalog_status.set("Codex 路径已改变，请刷新模型列表。"))
+        self.after(0, lambda: refresh_models() if dialog.winfo_exists() else None)
+        self.after(100, poll_models)
+
         actions = ttk.Frame(frame)
         actions.grid(row=4, column=0, columnspan=2, sticky="e", pady=(16, 0))
 
@@ -5738,14 +5810,20 @@ class Application(tk.Tk):
             if not selected_live_model or not selected_preload_model:
                 messagebox.showerror("设置", "实时模型和预翻译模型都不能为空。", parent=dialog)
                 return
-            if live_fast.get() and selected_live_model not in codex_fast_models():
+            for selected, effort in ((selected_live_model, live_reasoning.get()),
+                                     (selected_preload_model, preload_reasoning.get())):
+                supported = codex_reasoning_efforts(selected, codex_path.get().strip())
+                if not effort.strip() or (supported and effort not in supported):
+                    messagebox.showerror("推理强度", f"{selected} 不支持该推理强度，请重新选择。", parent=dialog)
+                    return
+            if live_fast.get() and selected_live_model not in codex_fast_models(codex_path.get().strip()):
                 messagebox.showerror(
                     "实时 Fast 模式",
                     f"{selected_live_model} 当前模型目录没有 Fast 服务层。",
                     parent=dialog,
                 )
                 return
-            if preload_fast.get() and selected_preload_model not in codex_fast_models():
+            if preload_fast.get() and selected_preload_model not in codex_fast_models(codex_path.get().strip()):
                 messagebox.showerror(
                     "预翻译 Fast 模式",
                     f"{selected_preload_model} 当前模型目录没有 Fast 服务层。",
