@@ -5,6 +5,7 @@ import itertools
 import os
 import queue
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -35,10 +36,15 @@ except ImportError as exc:  # pragma: no cover - packaged builds include Frida
 
 
 APP_NAME = "FGO 剧情文本监听器"
-APP_VERSION = "2.9.8"
+APP_VERSION = "2.10.0"
 PACKAGE = "com.aniplex.fategrandorder"
 GADGET_PORT = 27043
 SERVER_PORT = 27042
+BLUESTACKS_SERVER_PORT = 27044
+BLUESTACKS_SU = "/system/xbin/bstk/su"
+ARM64_SERVER = "frida-server-17.17.0-android-arm64"
+REMOTE_ARM64_SERVER = f"/data/local/tmp/{ARM64_SERVER}-fgo-story-listener"
+DEFAULT_SERIAL = "127.0.0.1:5555" if sys.platform == "darwin" else "127.0.0.1:5556"
 DEFAULT_TRANSLATION_MODEL = "gpt-5.6-terra"
 DEFAULT_PRELOAD_TRANSLATION_MODEL = "gpt-5.6-sol"
 WHOLE_STAGE_MAX_ROWS = 256
@@ -63,6 +69,9 @@ UI_GREEN = "#34C759"
 UI_ORANGE = "#FF9F0A"
 UI_RED = "#FF3B30"
 UI_JAPANESE = "#3A3A3C"
+UI_FONT = "PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei UI"
+COPY_MODIFIER = "Command" if sys.platform == "darwin" else "Control"
+COPY_HINT = "⌘C" if sys.platform == "darwin" else "Ctrl+C"
 
 
 def apple_button(
@@ -94,7 +103,7 @@ def apple_button(
         borderwidth=0,
         highlightthickness=0,
         cursor="hand2",
-        font=("Microsoft YaHei UI", 9, "bold"),
+        font=(UI_FONT, 9, "bold"),
         padx=12 if compact else 16,
         pady=5 if compact else 7,
     )
@@ -159,7 +168,12 @@ def resource_path(name: str) -> Path:
 
 
 def data_dir() -> Path:
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    default = (
+        Path.home() / "Library" / "Application Support"
+        if sys.platform == "darwin"
+        else Path.home() / "AppData" / "Local"
+    )
+    base = Path(os.environ.get("LOCALAPPDATA", default))
     path = base / "FgoStoryListener"
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -500,8 +514,22 @@ def _codex_launcher(candidate: str) -> list[str]:
     return [str(path)]
 
 
+def _macos_codex_candidates() -> list[Path]:
+    home = Path.home()
+    desktop_cli = Path("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+    return [
+        *(directory / app / desktop_cli
+          for directory in (Path("/Applications"), home / "Applications")
+          for app in ("ChatGPT.app", "Codex.app")),
+        home / ".local/bin/codex",
+        home / "Library/pnpm/bin/codex",
+        Path("/opt/homebrew/bin/codex"),
+        Path("/usr/local/bin/codex"),
+    ]
+
+
 def _codex_candidates() -> list[Path]:
-    """Inspect only PATH and the known desktop CLI install directory."""
+    """Find CLI installations that are visible to terminal and desktop launches."""
     candidates: list[Path] = []
     names = ("codex.exe", "codex.cmd", "codex.ps1", "codex")
     for directory in os.environ.get("PATH", "").split(os.pathsep):
@@ -515,6 +543,8 @@ def _codex_candidates() -> list[Path]:
             candidates.extend(sorted(desktop.glob("*/codex.exe")))
         except OSError:
             pass
+    elif sys.platform == "darwin":
+        candidates.extend(_macos_codex_candidates())
     result: list[Path] = []
     seen: set[str] = set()
     for path in candidates:
@@ -2242,7 +2272,7 @@ class HistoryStore:
 @dataclass
 class RuntimeConfig:
     adb_path: str = ""
-    serial: str = "127.0.0.1:5556"
+    serial: str = DEFAULT_SERIAL
     emulator_index: int = 0
     translation_enabled: bool = True
     translation_model: str = DEFAULT_TRANSLATION_MODEL
@@ -2275,7 +2305,7 @@ class RuntimeConfig:
             )
             return cls(
                 adb_path=str(value.get("adb_path", "")),
-                serial=str(value.get("serial", "127.0.0.1:5556")),
+                serial=str(value.get("serial") or "").strip() or DEFAULT_SERIAL,
                 emulator_index=int(value.get("emulator_index", 0)),
                 translation_enabled=bool(value.get("translation_enabled", True)),
                 translation_model=str(
@@ -3766,28 +3796,38 @@ class EmulatorBridge:
         self.notify = notify
         self.adb = self._find_adb()
         self.serial = config.serial
-        self.server_session = None
-        self.gadget_session = None
+        self.bluestacks = sys.platform == "darwin"
+        self.hook_session = None
         self.hook_script = None
         self.detached_event = threading.Event()
+        self._lock = threading.Lock()
+        self._native_pid: int | None = None
+        self._forward_port: int | None = None
+        self._native_address: str | None = None
 
     def _find_adb(self) -> Path:
-        choices = [
-            self.config.adb_path,
-            os.environ.get("FGO_ADB", ""),
-            r"E:\leidian\LDPlayer9\adb.exe",
-            r"C:\leidian\LDPlayer9\adb.exe",
-            r"D:\leidian\LDPlayer9\adb.exe",
-        ]
+        choices = [self.config.adb_path, os.environ.get("FGO_ADB", "")]
+        if sys.platform == "darwin":
+            choices.extend((
+                str(Path.home() / "Library/Android/sdk/platform-tools/adb"),
+                "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+                str(Path.home() / "Applications/BlueStacks.app/Contents/MacOS/hd-adb"),
+            ))
+        elif os.name == "nt":
+            choices.extend((
+                r"E:\leidian\LDPlayer9\adb.exe",
+                r"C:\leidian\LDPlayer9\adb.exe",
+                r"D:\leidian\LDPlayer9\adb.exe",
+            ))
         found = shutil.which("adb")
         if found:
             choices.append(found)
         for value in choices:
-            if value and Path(value).is_file():
-                self.config.adb_path = str(Path(value))
-                self.config.save()
-                return Path(value)
-        raise BridgeError("未找到雷电 ADB。可在 %LOCALAPPDATA%\\FgoStoryListener\\config.json 设置 adb_path。")
+            if value:
+                path = Path(value).expanduser()
+                if path.is_file() and os.access(path, os.X_OK):
+                    return path
+        raise BridgeError(f"未找到 ADB。可在 {data_dir() / 'config.json'} 设置 adb_path。")
 
     def _run(self, args: list[str], timeout: int = 30, check: bool = True) -> str:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -3808,6 +3848,11 @@ class EmulatorBridge:
 
     def adb_device(self, args: list[str], timeout: int = 30, check: bool = True) -> str:
         return self._run(["-s", self.serial, *args], timeout=timeout, check=check)
+
+    def _bluestacks_root(self, command: str, *, check: bool = True) -> str:
+        return self.adb_device(
+            ["shell", f"{BLUESTACKS_SU} -c {shlex.quote(command)}"], timeout=8, check=check
+        )
 
     def _repair_ldplayer_forward(self) -> None:
         candidates = [
@@ -3839,15 +3884,25 @@ class EmulatorBridge:
         )
 
     def connect_adb(self) -> None:
-        self.notify({"type": "status", "text": "正在连接雷电模拟器…"})
+        emulator = "BlueStacks Air" if self.bluestacks else "雷电模拟器"
+        self.notify({"type": "status", "text": f"正在连接 {emulator}…"})
         result = self._run(["connect", self.serial], check=False)
-        if "connected" not in result.lower() and "already" not in result.lower():
+        state = self.adb_device(["get-state"], check=False)
+        if state != "device" and not self.bluestacks:
             self._repair_ldplayer_forward()
             time.sleep(1)
             result = self._run(["connect", self.serial], check=False)
-        state = self.adb_device(["get-state"], check=False)
-        if "device" not in state:
-            raise BridgeError(f"无法连接雷电模拟器 {self.serial}：{result or state}")
+            state = self.adb_device(["get-state"], check=False)
+        if state != "device":
+            raise BridgeError(f"无法连接 {emulator} {self.serial}。请打开模拟器并启用 ADB。\n{result or state}")
+
+        if self.bluestacks:
+            abi = self.adb_device(["shell", "getprop", "ro.product.cpu.abi"])
+            if abi != "arm64-v8a":
+                raise BridgeError(f"需要 BlueStacks Air 的 ARM64 实例，当前 ABI 为 {abi}。")
+            if self._bluestacks_root("id -u", check=False) != "0":
+                raise BridgeError("BlueStacks Air 的 su 未返回 root 权限。")
+            return
 
         root_result = self.adb_device(["root"], check=False)
         if "restarting" in root_result.lower():
@@ -3873,18 +3928,23 @@ class EmulatorBridge:
 
     def _wait_pid(self, seconds: int = 30) -> int:
         deadline = time.time() + seconds
-        while time.time() < deadline:
+        while time.time() < deadline and not self.detached_event.is_set():
             value = self.adb_device(["shell", "pidof", PACKAGE], check=False).strip()
             if value:
                 try:
                     return int(value.split()[0])
                 except ValueError:
                     pass
-            time.sleep(1)
-        raise BridgeError("FGO 尚未运行。请先在雷电模拟器中启动游戏。")
+            self.detached_event.wait(1)
+        raise BridgeError("FGO 尚未运行。请先在模拟器中启动日服游戏。")
 
     def prepare(self) -> int:
         self.connect_adb()
+        if self.bluestacks:
+            pid = self._wait_pid()
+            self._prepare_bluestacks()
+            return pid
+
         runtime = resource_path("runtime")
         server = runtime / "frida-server-17.17.0-android-x86_64"
         gadget = runtime / "frida-gadget-17.17.0-android-arm64.so"
@@ -3958,6 +4018,26 @@ class EmulatorBridge:
         self._load_gadget(pid, installed_gadget)
         return pid
 
+    def _prepare_bluestacks(self) -> None:
+        self.notify({"type": "status", "text": "正在启动 BlueStacks ARM64 监听…"})
+        server = resource_path(f"runtime/{ARM64_SERVER}")
+        self._push_if_needed(server, REMOTE_ARM64_SERVER, "755")
+        with self._lock:
+            if self.detached_event.is_set():
+                raise BridgeError("监听已停止。")
+            output = self._bluestacks_root(
+                f"{REMOTE_ARM64_SERVER} -l 127.0.0.1:{BLUESTACKS_SERVER_PORT} "
+                ">/data/local/tmp/fgo-story-listener-frida.log 2>&1 </dev/null & echo $!"
+            )
+            if not output.isdecimal():
+                raise BridgeError(f"无法启动 BlueStacks 监听服务：{output}")
+            self._native_pid = int(output)
+            port = self.adb_device(["forward", "tcp:0", f"tcp:{BLUESTACKS_SERVER_PORT}"], timeout=8)
+            if not port.isdecimal():
+                raise BridgeError(f"ADB 未返回可用的监听端口：{port}")
+            self._forward_port = int(port)
+            self._native_address = f"127.0.0.1:{self._forward_port}"
+
     def _gadget_available(self) -> bool:
         result: queue.Queue[tuple[bool, Exception | None]] = queue.Queue(maxsize=1)
 
@@ -4027,24 +4107,48 @@ class EmulatorBridge:
             time.sleep(0.5)
         raise BridgeError("arm64 Gadget 已载入，但监听端口未就绪。")
 
-    def attach_hook(self) -> None:
+    def attach_hook(self, pid: int) -> None:
         manager = frida.get_device_manager()
-        device = manager.add_remote_device(f"127.0.0.1:{GADGET_PORT}")
-        processes = device.enumerate_processes()
-        if not processes:
-            raise BridgeError("Gadget 进程不可用。")
-        self.gadget_session = device.attach(processes[0].pid)
+        if self.bluestacks:
+            with self._lock:
+                if self.detached_event.is_set() or self._native_address is None:
+                    raise BridgeError("BlueStacks 监听服务尚未启动。")
+                device = manager.add_remote_device(self._native_address)
+            deadline = time.monotonic() + 8
+            while True:
+                try:
+                    session = device.attach(pid)
+                    break
+                except frida.ServerNotRunningError as exc:
+                    if time.monotonic() >= deadline or self.detached_event.wait(0.25):
+                        detail = self.adb_device(
+                            ["shell", "cat", "/data/local/tmp/fgo-story-listener-frida.log"],
+                            timeout=5, check=False,
+                        )
+                        raise BridgeError(f"BlueStacks 监听服务未就绪：{detail or exc}") from exc
+        else:
+            device = manager.add_remote_device(f"127.0.0.1:{GADGET_PORT}")
+            processes = device.enumerate_processes()
+            if not processes:
+                raise BridgeError("Gadget 进程不可用。")
+            session = device.attach(processes[0].pid)
+
         def on_detached(reason: Any, crash: Any) -> None:
             self.detached_event.set()
             self.notify(
                 {"type": "detached", "reason": str(reason), "crash": str(crash or "")}
             )
 
-        self.gadget_session.on("detached", on_detached)
-        source = resource_path("hook.js").read_text(encoding="utf-8-sig")
-        self.hook_script = self.gadget_session.create_script(source)
-        self.hook_script.on("message", self._on_frida_message)
-        self.hook_script.load()
+        with self._lock:
+            if self.detached_event.is_set():
+                session.detach()
+                raise BridgeError("监听已停止。")
+            self.hook_session = session
+            session.on("detached", on_detached)
+            source = resource_path("hook.js").read_text(encoding="utf-8-sig")
+            self.hook_script = session.create_script(source)
+            self.hook_script.on("message", self._on_frida_message)
+            self.hook_script.load()
 
     def _on_frida_message(self, message: dict[str, Any], data: bytes | None) -> None:
         if message.get("type") == "send" and isinstance(message.get("payload"), dict):
@@ -4062,16 +4166,41 @@ class EmulatorBridge:
 
     def close(self) -> None:
         self.detached_event.set()
-        if self.hook_script is not None:
-            try:
-                self.hook_script.unload()
-            except Exception:
-                pass
-        if self.gadget_session is not None:
-            try:
-                self.gadget_session.detach()
-            except Exception:
-                pass
+        with self._lock:
+            if self.hook_script is not None:
+                try:
+                    self.hook_script.unload()
+                except Exception:
+                    pass
+                self.hook_script = None
+            if self.hook_session is not None:
+                try:
+                    self.hook_session.detach()
+                except Exception:
+                    pass
+                self.hook_session = None
+            if self._native_address is not None:
+                try:
+                    frida.get_device_manager().remove_remote_device(self._native_address)
+                except Exception:
+                    pass
+                self._native_address = None
+            if self._forward_port is not None:
+                try:
+                    self.adb_device(["forward", "--remove", f"tcp:{self._forward_port}"], timeout=5, check=False)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                self._forward_port = None
+            if self._native_pid is not None:
+                pid = self._native_pid
+                try:
+                    self._bluestacks_root(
+                        f'if [ "$(readlink /proc/{pid}/exe)" = {REMOTE_ARM64_SERVER} ]; then kill {pid}; fi',
+                        check=False,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                self._native_pid = None
 
 
 class DialogueProcessor:
@@ -4267,11 +4396,10 @@ class ListenerThread(threading.Thread):
                 # trusted managed strings off Frida's callback thread. No
                 # framebuffer capture or OCR is performed.
                 self.bridge = EmulatorBridge(self.config, self.events.put)
-                self.bridge.prepare()
+                pid = self.bridge.prepare()
                 self.processor = DialogueProcessor(self.bridge, self.events, self.stop_event)
                 self.bridge.notify = self.processor.notify
-                self.bridge.attach_hook()
-                self.events.put({"type": "status", "text": "监听中：请在 FGO 内打开剧情", "ready": True})
+                self.bridge.attach_hook(pid)
                 while not self.stop_event.wait(0.5):
                     if self.bridge.detached_event.is_set():
                         break
@@ -4331,7 +4459,7 @@ class BilingualOverlay(tk.Toplevel):
             textvariable=self.quest_var,
             bg=UI_CARD,
             fg=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT, 9),
             anchor="w",
         ).pack(side="left", fill="x", expand=True)
         self.log_button = apple_button(
@@ -4350,7 +4478,7 @@ class BilingualOverlay(tk.Toplevel):
             textvariable=self.speaker_var,
             bg=UI_CARD,
             fg=UI_BLUE,
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=(UI_FONT, 11, "bold"),
             anchor="nw",
             justify="left",
         )
@@ -4376,7 +4504,7 @@ class BilingualOverlay(tk.Toplevel):
             textvariable=self.translation_var,
             bg=UI_CARD,
             fg=UI_TEXT,
-            font=("Microsoft YaHei UI", 13, "bold"),
+            font=(UI_FONT, 13, "bold"),
             anchor="nw",
             justify="left",
             wraplength=800,
@@ -4486,7 +4614,7 @@ class BilingualLogWindow(tk.Toplevel):
             textvariable=self.title_var,
             bg=UI_CARD,
             fg=UI_TEXT,
-            font=("Microsoft YaHei UI", 13, "bold"),
+            font=(UI_FONT, 13, "bold"),
             anchor="w",
         ).pack(side="left", fill="x", expand=True)
         self.back_button = apple_button(
@@ -4504,7 +4632,7 @@ class BilingualLogWindow(tk.Toplevel):
             textvariable=self.hint_var,
             bg=UI_CARD,
             fg=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT, 9),
             anchor="w",
         ).pack(fill="x", padx=18, pady=(0, 13))
 
@@ -4537,23 +4665,23 @@ class BilingualLogWindow(tk.Toplevel):
         scroll.pack(side="right", fill="y", padx=(0, 3), pady=4)
         self.text.tag_configure(
             "speaker", foreground=UI_BLUE,
-            font=("Microsoft YaHei UI", 10, "bold"), spacing1=14,
+            font=(UI_FONT, 10, "bold"), spacing1=14,
         )
         self.text.tag_configure(
             "source", foreground=UI_JAPANESE, font=("Yu Gothic UI", 12)
         )
         self.text.tag_configure(
             "translation", foreground=UI_TEXT,
-            font=("Microsoft YaHei UI", 13, "bold"),
+            font=(UI_FONT, 13, "bold"),
             lmargin1=12, lmargin2=12, spacing1=5,
         )
         self.text.tag_configure(
-            "pending", foreground=UI_TERTIARY, font=("Microsoft YaHei UI", 10)
+            "pending", foreground=UI_TERTIARY, font=(UI_FONT, 10)
         )
         self.text.tag_configure("separator", foreground=UI_DIVIDER, spacing3=7)
         self.text.tag_configure("selected_row", background=UI_BLUE_TINT)
-        self.text.bind("<Control-c>", self._copy_selection)
-        self.text.bind("<Control-C>", self._copy_selection)
+        self.text.bind(f"<{COPY_MODIFIER}-c>", self._copy_selection)
+        self.text.bind(f"<{COPY_MODIFIER}-C>", self._copy_selection)
         self.text.bind("<MouseWheel>", self._mousewheel)
         self.text.bind("<Button-1>", self._select_at, add="+")
         self.text.bind("<Double-Button-1>", self._explain_at, add="+")
@@ -4737,7 +4865,7 @@ class ExplanationWindow(tk.Toplevel):
         title_row.pack(fill="x", padx=20, pady=(16, 7))
         tk.Label(
             title_row, text="理解这句话", bg=UI_CARD, fg=UI_TEXT,
-            font=("Microsoft YaHei UI", 15, "bold"), anchor="w",
+            font=(UI_FONT, 15, "bold"), anchor="w",
         ).pack(side="left")
         self.close_button = apple_button(title_row, "完成", self.hide, compact=True)
         self.close_button.pack(side="right")
@@ -4745,7 +4873,7 @@ class ExplanationWindow(tk.Toplevel):
         self.target_var = tk.StringVar(value="")
         tk.Label(
             header, textvariable=self.quest_var, bg=UI_CARD, fg=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 9), anchor="w",
+            font=(UI_FONT, 9), anchor="w",
         ).pack(fill="x", padx=20)
         self.target_label = tk.Label(
             header, textvariable=self.target_var, bg=UI_CARD, fg=UI_JAPANESE,
@@ -4763,7 +4891,7 @@ class ExplanationWindow(tk.Toplevel):
             body, wrap="char", bg=UI_CARD, fg=UI_TEXT,
             selectbackground="#B9D8FF", selectforeground=UI_TEXT,
             relief="flat", borderwidth=0, highlightthickness=0,
-            padx=24, pady=20, font=("Microsoft YaHei UI", 11),
+            padx=24, pady=20, font=(UI_FONT, 11),
             spacing3=4,
         )
         scroll = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
@@ -4772,15 +4900,15 @@ class ExplanationWindow(tk.Toplevel):
         scroll.pack(side="right", fill="y", padx=(0, 3), pady=4)
         self.text.tag_configure(
             "heading", foreground=UI_BLUE,
-            font=("Microsoft YaHei UI", 11, "bold"), spacing1=12, spacing3=6,
+            font=(UI_FONT, 11, "bold"), spacing1=12, spacing3=6,
         )
         self.text.tag_configure(
             "body", foreground=UI_TEXT,
-            font=("Microsoft YaHei UI", 11), spacing3=8,
+            font=(UI_FONT, 11), spacing3=8,
         )
         self.text.tag_configure(
             "loading", foreground=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 11), justify="center", spacing1=80,
+            font=(UI_FONT, 11), justify="center", spacing1=80,
         )
         self.text.tag_configure("link", foreground=UI_BLUE, underline=True)
         self.text.tag_bind("link", "<Enter>", lambda _event: self.text.configure(cursor="hand2"))
@@ -4793,7 +4921,7 @@ class ExplanationWindow(tk.Toplevel):
         self.status_var = tk.StringVar(value="解释会自动缓存，重复查看不会消耗新的请求")
         tk.Label(
             footer, textvariable=self.status_var, bg=UI_BG, fg=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 9), anchor="w",
+            font=(UI_FONT, 9), anchor="w",
         ).pack(side="left", fill="x", expand=True)
         self.copy_button = apple_button(footer, "复制解释", self.copy, compact=True)
         self.copy_button.configure(state="disabled")
@@ -4990,7 +5118,7 @@ class Application(tk.Tk):
             borderwidth=0,
             relief="flat",
             rowheight=38,
-            font=("Microsoft YaHei UI", 10),
+            font=(UI_FONT, 10),
         )
         style.map(
             "App.Treeview",
@@ -5006,7 +5134,7 @@ class Application(tk.Tk):
             darkcolor="#F8F8FA",
             relief="flat",
             padding=(10, 9),
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT, 9, "bold"),
         )
         style.map("App.Treeview.Heading", background=[("active", "#F0F0F3")])
         style.configure(
@@ -5022,7 +5150,7 @@ class Application(tk.Tk):
             "App.TCheckbutton",
             background=UI_CARD,
             foreground=UI_TEXT,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT, 9),
         )
         style.map("App.TCheckbutton", background=[("active", UI_CARD)])
 
@@ -5041,14 +5169,14 @@ class Application(tk.Tk):
             text="FGO 剧情助手",
             bg=UI_CARD,
             fg=UI_TEXT,
-            font=("Microsoft YaHei UI", 17, "bold"),
+            font=(UI_FONT, 17, "bold"),
             anchor="w",
         ).pack(fill="x")
         status_line = tk.Frame(hero_left, bg=UI_CARD)
         status_line.pack(fill="x", pady=(5, 0))
         self.status_dot = tk.Label(
             status_line, text="●", bg=UI_CARD, fg=UI_RED,
-            font=("Segoe UI", 10),
+            font=(UI_FONT if sys.platform == "darwin" else "Segoe UI", 10),
         )
         self.status_dot.pack(side="left")
         tk.Label(
@@ -5056,7 +5184,7 @@ class Application(tk.Tk):
             textvariable=self.status_var,
             bg=UI_CARD,
             fg=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT, 9),
             anchor="w",
         ).pack(side="left", padx=(6, 0))
 
@@ -5082,14 +5210,14 @@ class Application(tk.Tk):
             text="剧情记录",
             bg=UI_CARD,
             fg=UI_TEXT,
-            font=("Microsoft YaHei UI", 12, "bold"),
+            font=(UI_FONT, 12, "bold"),
         ).pack(side="left")
         tk.Label(
             controls_top,
             textvariable=self.count_var,
             bg=UI_CARD,
             fg=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT, 9),
         ).pack(side="left", padx=(10, 0))
         ttk.Checkbutton(
             controls_top,
@@ -5121,7 +5249,7 @@ class Application(tk.Tk):
             text="关卡",
             bg=UI_CARD,
             fg=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT, 9),
         ).pack(side="right")
 
         tk.Frame(controls, bg=UI_DIVIDER, height=1).pack(fill="x", padx=20)
@@ -5132,7 +5260,7 @@ class Application(tk.Tk):
             textvariable=self.translation_status_var,
             bg=UI_CARD,
             fg=UI_BLUE,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT, 9),
             anchor="w",
         ).pack(side="left", fill="x", expand=True)
         apple_button(
@@ -5149,7 +5277,7 @@ class Application(tk.Tk):
             textvariable=self.knowledge_status_var,
             bg=UI_CARD,
             fg=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT, 9),
             anchor="w",
         ).pack(side="left", fill="x", expand=True)
         self.rollback_knowledge_button = apple_button(
@@ -5197,8 +5325,8 @@ class Application(tk.Tk):
         table_card.rowconfigure(0, weight=1)
         table_card.columnconfigure(0, weight=1)
         self.tree.bind("<Double-1>", lambda _event: self.explain_selected_from_table())
-        self.tree.bind("<Control-c>", self._copy_shortcut)
-        self.tree.bind("<Control-C>", self._copy_shortcut)
+        self.tree.bind(f"<{COPY_MODIFIER}-c>", self._copy_shortcut)
+        self.tree.bind(f"<{COPY_MODIFIER}-C>", self._copy_shortcut)
         self.tree.tag_configure(
             "preloaded", background="#F2F7FC", foreground=UI_SECONDARY
         )
@@ -5218,10 +5346,10 @@ class Application(tk.Tk):
         ).pack(side="right")
         tk.Label(
             footer,
-            text="双击一行查看解释  ·  Ctrl+C 复制选中内容",
+            text=f"双击一行查看解释  ·  {COPY_HINT} 复制选中内容",
             bg=UI_BG,
             fg=UI_SECONDARY,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT, 9),
         ).pack(side="right", padx=16)
 
     def _knowledge_status_text(self) -> str:
@@ -5989,7 +6117,7 @@ class Application(tk.Tk):
             hooks = len(event.get("hooks", []))
             backlog_count = int(event.get("backlog_count", 0) or 0)
             suffix = f"，已读取游戏 LOG {backlog_count} 条" if backlog_count else ""
-            self.status_var.set(f"IL2CPP Hook 已就绪（{hooks} 个{suffix}）")
+            self.status_var.set(f"监听中（{hooks} 个 Hook{suffix}）")
             self.status_dot.configure(fg="#2d9b55")
         elif kind == "scenario_plan":
             if not (

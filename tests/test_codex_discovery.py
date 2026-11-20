@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,6 +17,9 @@ class CodexDiscoveryTests(unittest.TestCase):
         env = patch.dict(os.environ, {"PATH": "", "LOCALAPPDATA": str(self.root / "local")})
         env.start()
         self.addCleanup(env.stop)
+        desktop = patch.object(app, "_macos_codex_candidates", return_value=[])
+        self.macos_candidates = desktop.start()
+        self.addCleanup(desktop.stop)
 
     def cli(self, directory, name="codex.exe"):
         path = self.root / directory / name
@@ -51,6 +55,14 @@ class CodexDiscoveryTests(unittest.TestCase):
         explicit = self.cli("explicit")
         with patch.object(app.subprocess, "run", side_effect=AssertionError("must not probe explicit choice")):
             self.assertEqual(app._codex_command(str(explicit)), [str(explicit)])
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS desktop installation")
+    def test_desktop_cli_is_discovered_with_empty_path_on_macos(self):
+        cli = self.cli("Applications/ChatGPT.app/Contents/Resources/codex-cli/"
+                       "CodexCLI.app/Contents/MacOS", "codex")
+        self.macos_candidates.return_value = [cli]
+        with self.run_version({str(cli): "0.167.0"}):
+            self.assertEqual(app._codex_command(), [str(cli)])
 
     @unittest.skipUnless(os.name == "nt", "Windows npm launcher")
     def test_newer_npm_cli_can_win_and_launchers_are_deduplicated(self):

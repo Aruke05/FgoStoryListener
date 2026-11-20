@@ -2,8 +2,8 @@
 
 /*
  * FGO story hook (IL2CPP, arm64).
- * This script is loaded by the arm64 Frida Gadget running through LDPlayer's
- * NativeBridge/Houdini layer.  Do not load it through the x86_64 server.
+ * The script runs in the ARM64 game process through Frida Server on BlueStacks
+ * Air or through the ARM64 Gadget on LDPlayer.
  */
 
 const state = {

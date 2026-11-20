@@ -1,11 +1,17 @@
 # FGO 剧情文本监听器
 
-> Windows · 雷电模拟器 9 · 日服 FGO · IL2CPP 只读 Hook · Codex 连续翻译
+> macOS / BlueStacks Air · Windows / 雷电模拟器 9 · 日服 FGO · Codex 连续翻译
 
 实时读取日服 FGO 的剧情台词、人物名、选项与游戏 LOG，使用本机已登录的
 `codex-cli` 生成中文译文，并保存为可筛选、复制和导出的双语历史记录。
 
-当前版本：**v2.9.8**
+当前版本 **v2.10.0**
+
+### v2.10.0 支持 BlueStacks Air
+
+- 提供 Apple Silicon 原生 macOS App，启动后通过本机 ADB 自动连接 BlueStacks Air。
+- 在 BlueStacks Air 上直接监听 ARM64 日服 FGO 进程，退出 App 时释放监听会话。
+- 支持从 macOS 桌面版 ChatGPT 或 Codex 中自动发现 Codex CLI。
 
 ### v2.9.8 CLI 自动发现修复
 
@@ -49,15 +55,31 @@
 
 ## 环境要求
 
-- Windows 10/11 x64
-- 雷电模拟器 9（Android 9），已开启 **ADB 本机连接** 和 **Root 权限**
+- Apple Silicon Mac 和 BlueStacks Air，已启用 **ADB 本机连接**，镜像提供 BlueStacks 内置 `su`。
+- Windows 10/11 x64 和雷电模拟器 9（Android 9），已开启 **ADB 本机连接** 和 **Root 权限**。
 - 日服 FGO：`com.aniplex.fategrandorder`
 - 已安装并登录 `codex-cli`（AI 翻译与“解释这句”需要）
-- 从源码构建时需要 Python 3.11、Git LFS 和 PowerShell
+- 从源码构建需要 Python 3.11 或更新版本及 Git LFS。macOS 版还需要支持 Tk 的 ARM64 Python，Windows 版需要 PowerShell。
 
 ## 快速开始
 
-### 使用发布包
+### macOS 和 BlueStacks Air
+
+1. 在 BlueStacks Air 的高级设置中打开 Android Debug Bridge，再启动日服 FGO。
+2. 打开 `FgoStoryListener.app`。程序默认连接 `127.0.0.1:5555`，也可在设置中指定 ADB 地址。
+3. 等状态显示“监听中”后进入剧情。需要中文翻译时，使用已登录的 Codex CLI。
+
+在 Apple Silicon Mac 上构建 App。
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-build.txt
+./build-macos.sh
+```
+
+构建产物位于 `dist-macos/FgoStoryListener.app`，可以移入“应用程序”。
+
+### 使用 Windows 发布包
 
 1. 从仓库的 **Releases** 页面下载最新的 `FgoStoryListener-*-win64.zip`。
 2. 完整解压压缩包；不要只把 EXE 单独复制出来。
@@ -90,7 +112,7 @@ python .\fgo_story_listener.py
 # 单元测试
 python -m unittest discover -s tests -v
 
-# 生成 dist-v2.9.8\FgoStoryListener
+# 生成 dist-v2.10.0\FgoStoryListener
 .\build.ps1
 ```
 
@@ -99,16 +121,16 @@ python -m unittest discover -s tests -v
 
 ## 使用
 
-1. 在雷电模拟器设置中开启 **ADB 本机连接** 和 **Root 权限**，重启模拟器。
+1. 按当前平台的快速开始步骤启用模拟器的 ADB 和所需权限。
 2. 启动 FGO。
-3. 运行 `FgoStoryListener.exe`，等状态显示“监听中”。
+3. 打开 FgoStoryListener，等状态显示“监听中”。
 4. 进入剧情；监听器会先直接读取游戏自己的 `LOG` 历史，再接着实时监听新台词。
 5. 剧情选择框出现时，所有选项以及最终选中的一项都会写入历史。
-6. 选中一行或多行后可直接按 `Ctrl+C`，也可使用“复制选中”“复制全部”或“导出 TXT”。
+6. 选中一行或多行后，在 macOS 上按 `⌘C`，在 Windows 上按 `Ctrl+C`。也可使用“复制选中”“复制全部”或“导出 TXT”。
 7. 界面中的“关卡筛选”可以只显示、复制或导出当前关卡的记录。
 8. “设置”中可以分别选择实时翻译与完整剧情预翻译的 Codex 模型、推理强度和 Fast 模式，并控制当前译文窗口。
-9. 当前译文会自动显示日文和中文；点击“查看 LOG”会打开当前关卡的双语记录页，默认停在最新一句，可直接向上滚动查看、选择并按 `Ctrl+C` 复制，不再打开主窗口。
-   主窗口、当前译文和双语 LOG 都使用 Windows 默认窗口层级，不使用 `topmost` 或强制抢焦点。
+9. 当前译文会自动显示日文和中文；点击“查看 LOG”会打开当前关卡的双语记录页，默认停在最新一句，可直接向上滚动查看、选择并使用复制快捷键。
+   主窗口、当前译文和双语 LOG 都使用系统默认窗口层级。
    人物名也会显示为 `中文名（日文原名）`：先使用更新术语库中的精确、可追溯名称；词库没有的剧情昵称由当前翻译批次生成并按关卡缓存。无人物名的旁白、场景描写和内心文字仍保持空白。
 10. 点击“更新术语与口癖”，程序会在后台重新读取日服/国服游戏数据、Mooncell 从者、活动及日中语音表；监听和旧知识库在构建期间保持可用。
 11. 看不懂某句话时，点击当前译文中的“解释这句”，或在双语 LOG 中点选一句后点击“解释这句”。程序会把该关卡现有的完整双语剧情和目标句一起交给 Codex；遇到当前关卡无法解释的旧剧情指代、人物别称或多年以前的梗时，默认按需联网查证。解释会说明字面意思、以前发生过什么、当前前因后果、语气与言外之意，并列出可点击的参考页面。它默认避免泄露目标句之后的事件，并会缓存到历史数据库；重复查看不再调用模型。
@@ -193,8 +215,11 @@ python -m unittest discover -s tests -v
 %LOCALAPPDATA%\FgoStoryListener\history.db
 ```
 
+macOS 历史数据库位于 `~/Library/Application Support/FgoStoryListener/history.db`。
+
 ## 工作方式
 
+- macOS 通过 ADB 连接 BlueStacks Air，使用内置 `su` 启动 ARM64 Frida 服务并连接 FGO 进程。
 - Windows 程序通过 ADB 连接雷电模拟器。
 - x86_64 控制桥只负责调用 Houdini NativeBridge。
 - arm64 Frida Gadget 在 FGO 进程的 arm64 IL2CPP 上下文中运行。
@@ -221,11 +246,12 @@ python -m unittest discover -s tests -v
 ## 当前适配
 
 - 包名：`com.aniplex.fategrandorder`
-- 已验证版本：`2.138.0`（versionCode 496）
+- BlueStacks Air 5.21.780.7504，原生 ARM64 日服 FGO `2.141.1`（versionCode 506）。
+- 雷电模拟器上的既有验证版本为日服 FGO `2.138.0`（versionCode 496）。
 - 雷电模拟器 9，Android 9，FGO arm64 通过 Houdini 运行
 
 FGO 更新后，本程序会重新寻找当前安装目录并动态解析 IL2CPP 类和方法；如果类名或方法签名改变，需要更新 `hook.js`。
 
 ## 安全停止
 
-直接关闭 Windows 软件即可卸载本次 Hook 会话。FGO 进程退出或重启后，软件会等待并自动重新连接。
+退出 FgoStoryListener 即可卸载本次 Hook 会话。FGO 进程退出或重启后，软件会等待并自动重新连接。
