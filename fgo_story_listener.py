@@ -36,7 +36,7 @@ except ImportError as exc:  # pragma: no cover - packaged builds include Frida
 
 
 APP_NAME = "FGO 剧情文本监听器"
-APP_VERSION = "2.10.1"
+APP_VERSION = "2.11.0"
 PACKAGE = "com.aniplex.fategrandorder"
 GADGET_PORT = 27043
 SERVER_PORT = 27042
@@ -82,8 +82,10 @@ def apple_button(
     primary: bool = False,
     destructive: bool = False,
     compact: bool = False,
-) -> tk.Button:
-    """Create a predictable flat Windows button with Apple-like hierarchy."""
+) -> tk.Button | ttk.Button:
+    if sys.platform == "darwin" and primary:
+        return ttk.Button(parent, text=text, command=command, style="ReaderPrimary.TButton",
+                          padding=(12 if compact else 16, 5 if compact else 7))
     if primary:
         bg, fg, active = UI_BLUE, "#FFFFFF", UI_BLUE_ACTIVE
     elif destructive:
@@ -331,7 +333,7 @@ def backlog_match_key(speaker: str, text: str) -> tuple[str, str]:
     clean_text = normalize_text(text)
     if clean_speaker == "【已选择】":
         clean_text = re.sub(r"^\d+\.\s*", "", clean_text)
-    return clean_speaker, clean_text
+    return clean_speaker, clean_text.replace("\n", "")
 
 
 def contains_japanese(value: str) -> bool:
@@ -660,6 +662,7 @@ class HistoryStore:
             "translation_status": "TEXT NOT NULL DEFAULT ''",
             "translation_updated_at": "TEXT NOT NULL DEFAULT ''",
             "preloaded": "INTEGER NOT NULL DEFAULT 0",
+            "page_id": "INTEGER",
         }
         for name, definition in translation_columns.items():
             if name not in columns:
@@ -675,6 +678,9 @@ class HistoryStore:
                 PRIMARY KEY (quest, memory_key)
             )
             """
+        )
+        self._db.execute(
+            "CREATE VIEW IF NOT EXISTS reading_dialogue AS SELECT * FROM dialogue WHERE page_id IS NULL"
         )
         self._db.execute(
             """
@@ -927,7 +933,83 @@ class HistoryStore:
                     "UPDATE dialogue SET translation = ? WHERE id = ?",
                     (corrected, row_id),
                 )
+        if not self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='dialogue_page_lookup'"
+        ).fetchone():
+            # Reconcile in capture order, including snapshots taken after reopening the App.
+            for row_id, quest, speaker, text, source in self._db.execute(
+                "SELECT id, quest, speaker, text, source FROM dialogue WHERE preloaded=0 ORDER BY id"
+            ).fetchall():
+                if source == "ScriptBackLog.logData":
+                    self._fold_live_fragments(row_id, quest, speaker, text)
+                elif source.startswith("CurrentMessageSnapshot"):
+                    page = self._snapshot_page(row_id, quest, speaker, text)
+                    if page:
+                        self._fold_rows(page, [row_id])
+            self._db.execute(
+                "CREATE INDEX dialogue_page_lookup ON dialogue(quest, speaker, text) WHERE page_id IS NULL"
+            )
+
         self._db.commit()
+
+    def _snapshot_page(self, before_id: int, quest: str, speaker: str, text: str) -> int | None:
+        row = self._db.execute(
+            "SELECT id, quest, speaker, text, source FROM reading_dialogue "
+            "WHERE preloaded=0 AND id < ? ORDER BY id DESC LIMIT 1", (before_id,),
+        ).fetchone()
+        if (row and row[1] == quest and row[4] == "ScriptBackLog.logData"
+                and backlog_match_key(row[2], row[3]) == backlog_match_key(speaker, text)):
+            return int(row[0])
+        return None
+
+    def _fold_rows(self, page: int, fragments: list[int]) -> None:
+        # Retain raw captures, translations and links for diagnostics. Only the
+        # canonical page is presented or scheduled for subsequent translation.
+        self._db.executemany("UPDATE dialogue SET page_id=? WHERE id=?",
+                             [(page, fragment) for fragment in fragments])
+        marks = ",".join("?" for _ in fragments)
+        translated = self._db.execute(
+            f"SELECT translation, translation_model, translation_updated_at FROM dialogue "
+            f"WHERE id IN ({marks}) ORDER BY id", fragments,
+        ).fetchall()
+        if all(row[0] for row in translated):
+            self._db.execute(
+                "UPDATE dialogue SET translation=?, translation_model=?, translation_status='done', "
+                "translation_updated_at=? WHERE id=? AND translation=''",
+                ("".join(row[0] for row in translated), translated[0][1],
+                 max(row[2] for row in translated), page),
+            )
+
+    def cached_page_translation(self, quest: str, speaker: str, text: str) -> str:
+        """Preview only an unambiguous completed translation for this exact line."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT DISTINCT translation FROM reading_dialogue "
+                "WHERE quest=? AND speaker=? AND text=? AND translation<>'' LIMIT 2",
+                (quest, sanitize_speaker(speaker), normalize_text(text)),
+            ).fetchall()
+        return str(rows[0][0]) if len(rows) == 1 else ""
+
+    def _fold_live_fragments(self, page: int, quest: str, speaker: str, text: str) -> list[int]:
+        remaining = backlog_match_key(speaker, text)[1]
+        fragments = []
+        for row_id, stage, name, line, source in self._db.execute(
+            "SELECT id,quest,speaker,text,source FROM reading_dialogue "
+            "WHERE preloaded=0 AND id < ? ORDER BY id DESC LIMIT 32", (page,),
+        ):
+            if (stage != quest or name != speaker or not source.startswith(
+                    ("ScriptMessageCommonManager.AddText", "ScriptMessageCommonManager.SetText",
+                     "CurrentMessageSnapshot"))):
+                break
+            part = backlog_match_key(name, line)[1]
+            if not part or not remaining.endswith(part):
+                break
+            fragments.append(row_id)
+            remaining = remaining[:-len(part)]
+            if not remaining:
+                self._fold_rows(page, fragments)
+                return fragments
+        return []
 
     def add(
         self,
@@ -946,8 +1028,12 @@ class HistoryStore:
         if not clean_text or clean_text.strip().lower() == "select":
             return None
         with self._lock:
+            if source.startswith("CurrentMessageSnapshot"):
+                page = self._snapshot_page(2**63 - 1, clean_quest, clean_speaker, clean_text)
+                if page is not None:
+                    return page
             previous = self._db.execute(
-                "SELECT id, captured_at, speaker, raw_speaker, source FROM dialogue "
+                "SELECT id, captured_at, speaker, raw_speaker, source FROM reading_dialogue "
                 "WHERE preloaded = 0 "
                 "AND quest = ? AND speaker = ? AND text = ? "
                 "ORDER BY id DESC LIMIT 1",
@@ -966,7 +1052,7 @@ class HistoryStore:
             # event window, and only when exactly one side has no speaker.
             # This cannot merge two real speakers saying the same short line.
             speaker_candidate = self._db.execute(
-                "SELECT id, captured_at, speaker, raw_speaker, source FROM dialogue "
+                "SELECT id, captured_at, speaker, raw_speaker, source FROM reading_dialogue "
                 "WHERE preloaded = 0 AND quest = ? AND text = ? "
                 "AND ((speaker = '' AND ? <> '') OR (speaker <> '' AND ? = '')) "
                 "ORDER BY id DESC LIMIT 1",
@@ -1027,8 +1113,19 @@ class HistoryStore:
                     translation_status,
                 ),
             )
+            row_id = int(cur.lastrowid)
+            if not translation_status:
+                cached = self.cached_page_translation(clean_quest, clean_speaker, clean_text)
+                if cached:
+                    self._db.execute(
+                        "UPDATE dialogue SET (translation, translation_model, translation_updated_at) = "
+                        "(SELECT translation, translation_model, translation_updated_at FROM reading_dialogue "
+                        "WHERE quest=? AND speaker=? AND text=? AND translation=? ORDER BY id DESC LIMIT 1), "
+                        "translation_status='done' WHERE id=?",
+                        (clean_quest, clean_speaker, clean_text, cached, row_id),
+                    )
             self._db.commit()
-            return int(cur.lastrowid)
+            return row_id
 
     def max_order(self) -> int:
         with self._lock:
@@ -1280,6 +1377,7 @@ class HistoryStore:
         captured_at: datetime,
         before_order: int,
         source: str = "ScriptBackLog.logData",
+        folded_ids: list[int] | None = None,
     ) -> list[int]:
         clean: list[tuple[str, str]] = []
         for entry in entries:
@@ -1311,7 +1409,7 @@ class HistoryStore:
             def visible_rows() -> list[tuple[Any, ...]]:
                 return list(
                     self._db.execute(
-                        "SELECT id, display_order, quest, speaker, text FROM dialogue "
+                        "SELECT id, display_order, quest, speaker, text, source FROM reading_dialogue "
                         "WHERE preloaded = 0 ORDER BY display_order, id"
                     )
                 )
@@ -1411,18 +1509,18 @@ class HistoryStore:
             # internal thought), so reconcile in both directions: fill a name
             # that arrived late, or clear a stale live name for a nameless LOG
             # entry. Never manufacture a "旁白" speaker.
-            speaker_repairs: list[tuple[str, str, str, int]] = []
+            speaker_repairs: list[tuple[str, str, str, str, int]] = []
             for wanted_index, global_index in matched.items():
                 wanted_speaker, _wanted_text = wanted[wanted_index]
                 row = global_rows[global_index]
                 existing_speaker = sanitize_speaker(str(row[3]))
-                if wanted_speaker != existing_speaker:
+                if wanted_speaker != existing_speaker or row[5] != source or row[4] != clean[wanted_index][1]:
                     speaker_repairs.append(
-                        (wanted_speaker, wanted_speaker, source, int(row[0]))
+                        (wanted_speaker, wanted_speaker, source, clean[wanted_index][1], int(row[0]))
                     )
             if speaker_repairs:
                 self._db.executemany(
-                    "UPDATE dialogue SET speaker = ?, raw_speaker = ?, source = ? WHERE id = ?",
+                    "UPDATE dialogue SET speaker = ?, raw_speaker = ?, source = ?, text = ? WHERE id = ?",
                     speaker_repairs,
                 )
 
@@ -1496,6 +1594,9 @@ class HistoryStore:
                 inserted_ids[index] = row_id
                 ids.append(row_id)
                 self.link_preloaded_composition(row_id)
+                folded = self._fold_live_fragments(row_id, clean_quest, speaker, text)
+                if folded_ids is not None:
+                    folded_ids.extend(folded)
 
             # Re-number in the reconciled order. The database is small and
             # this avoids fragile assumptions about integer gaps after several
@@ -1521,7 +1622,7 @@ class HistoryStore:
             return None
         with self._lock:
             row = self._db.execute(
-                "SELECT id FROM dialogue WHERE preloaded = 0 AND quest = ? AND text = ? "
+                "SELECT id FROM reading_dialogue WHERE preloaded = 0 AND quest = ? AND text = ? "
                 "AND (speaker = ? OR speaker = '' OR ? = '') "
                 "ORDER BY display_order DESC, id DESC LIMIT 1",
                 (clean_quest, clean_text, clean_speaker, clean_speaker),
@@ -1536,7 +1637,7 @@ class HistoryStore:
                 self._db.execute(
                     "SELECT id, captured_at, quest, speaker, text, source, "
                     "translation, translation_model, translation_status, translation_updated_at "
-                    f"FROM dialogue{where} ORDER BY display_order, id",
+                    f"FROM reading_dialogue{where} ORDER BY display_order, id",
                     params,
                 )
             )
@@ -1558,7 +1659,7 @@ class HistoryStore:
                 self._db.execute(
                     "SELECT id, captured_at, quest, speaker, text, source, "
                     "translation, translation_model, translation_status, "
-                    f"translation_updated_at, preloaded FROM dialogue{where} "
+                    f"translation_updated_at, preloaded FROM reading_dialogue{where} "
                     "ORDER BY display_order, id",
                     tuple(params),
                 )
@@ -1575,7 +1676,7 @@ class HistoryStore:
                 "EXISTS(SELECT 1 FROM choice_translation_link link "
                 "JOIN dialogue source ON source.id = link.choice_row_id "
                 "WHERE link.selected_row_id = d.id AND source.translation = '' "
-                "AND source.translation_status <> 'error') FROM dialogue d "
+                "AND source.translation_status <> 'error') FROM reading_dialogue d "
                 f"WHERE d.id IN ({placeholders}) ORDER BY d.display_order, d.id",
                 tuple(row_ids),
             ).fetchall()
@@ -1599,7 +1700,7 @@ class HistoryStore:
             return [
                 int(row[0])
                 for row in self._db.execute(
-                    "SELECT d.id FROM dialogue d WHERE d.translation = '' "
+                    "SELECT d.id FROM reading_dialogue d WHERE d.translation = '' "
                     "AND d.preloaded = 0 "
                     "AND d.translation_status NOT IN ('translating', 'skipped') "
                     "AND NOT EXISTS(SELECT 1 FROM choice_translation_link link "
@@ -1618,7 +1719,7 @@ class HistoryStore:
             return [
                 int(row[0])
                 for row in self._db.execute(
-                    "SELECT id FROM dialogue WHERE quest = ? AND preloaded = 1 "
+                    "SELECT id FROM reading_dialogue WHERE quest = ? AND preloaded = 1 "
                     "AND translation = '' AND translation_status NOT IN ('translating', 'skipped') "
                     "ORDER BY display_order, id LIMIT ?",
                     (quest, limit),
@@ -1629,7 +1730,7 @@ class HistoryStore:
         """Return hidden pending rows only for the most recently staged scenario."""
         with self._lock:
             row = self._db.execute(
-                "SELECT quest FROM dialogue WHERE preloaded = 1 "
+                "SELECT quest FROM reading_dialogue WHERE preloaded = 1 "
                 "ORDER BY captured_at DESC, id DESC LIMIT 1"
             ).fetchone()
         if not row:
@@ -1640,7 +1741,7 @@ class HistoryStore:
         """Return stable whole-stage row/character totals for batch planning."""
         with self._lock:
             row = self._db.execute(
-                "SELECT COUNT(*), COALESCE(SUM(LENGTH(text)), 0) FROM dialogue "
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(text)), 0) FROM reading_dialogue "
                 "WHERE quest = ? AND preloaded = 1",
                 (normalize_text(quest) or "未知关卡",),
             ).fetchone()
@@ -1673,12 +1774,12 @@ class HistoryStore:
     def reset_translation_errors(self) -> list[int]:
         with self._lock:
             latest = self._db.execute(
-                "SELECT quest FROM dialogue WHERE preloaded = 1 "
+                "SELECT quest FROM reading_dialogue WHERE preloaded = 1 "
                 "ORDER BY captured_at DESC, id DESC LIMIT 1"
             ).fetchone()
             if latest:
                 rows = self._db.execute(
-                    "SELECT id FROM dialogue WHERE translation = '' "
+                    "SELECT id FROM reading_dialogue WHERE translation = '' "
                     "AND translation_status IN ('error', 'translating') "
                     "AND (preloaded = 0 OR (preloaded = 1 AND quest = ?)) "
                     "ORDER BY display_order, id",
@@ -1686,7 +1787,7 @@ class HistoryStore:
                 ).fetchall()
             else:
                 rows = self._db.execute(
-                    "SELECT id FROM dialogue WHERE translation = '' "
+                    "SELECT id FROM reading_dialogue WHERE translation = '' "
                     "AND translation_status IN ('error', 'translating') "
                     "AND preloaded = 0 ORDER BY display_order, id"
                 ).fetchall()
@@ -1706,7 +1807,7 @@ class HistoryStore:
     ) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT id, speaker, text, translation FROM dialogue "
+                "SELECT id, speaker, text, translation FROM reading_dialogue "
                 "WHERE quest = ? AND display_order < ? AND translation <> '' "
                 "AND translation_status <> 'skipped' "
                 "ORDER BY display_order DESC, id DESC LIMIT ?",
@@ -1741,14 +1842,14 @@ class HistoryStore:
         with self._lock:
             target = self._db.execute(
                 "SELECT id, display_order, quest, speaker, text, translation, preloaded "
-                "FROM dialogue WHERE id = ?",
+                "FROM reading_dialogue WHERE id = ?",
                 (int(row_id),),
             ).fetchone()
             if not target:
                 return None
             quest = str(target[2])
             rows = self._db.execute(
-                "SELECT id, speaker, text, translation, preloaded FROM dialogue "
+                "SELECT id, speaker, text, translation, preloaded FROM reading_dialogue "
                 "WHERE quest = ? AND translation_status <> 'skipped' "
                 "ORDER BY display_order, id",
                 (quest,),
@@ -1828,7 +1929,7 @@ class HistoryStore:
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             row = self._db.execute(
                 "SELECT COUNT(*), COALESCE(SUM(preloaded), 0) "
-                f"FROM dialogue{where}",
+                f"FROM reading_dialogue{where}",
                 tuple(params),
             ).fetchone()
         return int(row[0]), int(row[1])
@@ -2285,6 +2386,8 @@ class RuntimeConfig:
     translation_engine: str = "app-server"
     translation_fast_mode: bool = True
     show_translation_overlay: bool = True
+    reader_only: bool = False
+    reader_geometry: str = ""
     pretranslate_scenario: bool = True
     explanation_web_search: bool = True
     codex_path: str = ""
@@ -2330,6 +2433,8 @@ class RuntimeConfig:
                 translation_engine=str(value.get("translation_engine", "app-server")),
                 translation_fast_mode=bool(value.get("translation_fast_mode", True)),
                 show_translation_overlay=bool(value.get("show_translation_overlay", True)),
+                reader_only=bool(value.get("reader_only", False)),
+                reader_geometry=str(value.get("reader_geometry", "")),
                 pretranslate_scenario=bool(value.get("pretranslate_scenario", True)),
                 explanation_web_search=bool(
                     value.get("explanation_web_search", True)
@@ -4441,9 +4546,18 @@ class BilingualOverlay(tk.Toplevel):
         self.title("FGO 当前译文")
         self.configure(bg=UI_BG)
         self.attributes("-topmost", False)
-        self.geometry("960x380")
-        self.minsize(620, 330)
-        self.protocol("WM_DELETE_WINDOW", self.hide)
+        geometry = owner.config_data.reader_geometry
+        match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", geometry)
+        restore_geometry = False
+        if match:
+            width, height, x, y = map(int, match.groups())
+            restore_geometry = (480 <= width <= self.winfo_screenwidth() and
+                     180 <= height <= self.winfo_screenheight() and
+                     0 <= x < self.winfo_screenwidth() - 80 and
+                     0 <= y < self.winfo_screenheight() - 60)
+        self.geometry(geometry if restore_geometry else "760x245")
+        self.minsize(480, 180)
+        self.protocol("WM_DELETE_WINDOW", self.close_reader)
 
         self.card = tk.Frame(
             self, bg=UI_CARD, highlightbackground=UI_DIVIDER,
@@ -4462,6 +4576,7 @@ class BilingualOverlay(tk.Toplevel):
             font=(UI_FONT, 9),
             anchor="w",
         ).pack(side="left", fill="x", expand=True)
+        apple_button(self.header, "主窗口", owner.show_main_window, compact=True).pack(side="right")
         self.log_button = apple_button(
             self.header, "查看 LOG", owner.show_log, compact=True
         )
@@ -4542,27 +4657,41 @@ class BilingualOverlay(tk.Toplevel):
         self.update_idletasks()
         required = self.card.winfo_reqheight() + 32
         maximum = max(360, self.winfo_screenheight() - 140)
-        desired = max(330, min(maximum, required))
-        self.minsize(620, desired)
+        desired = max(180, min(maximum, required))
+        self.minsize(480, desired)
         if self.winfo_height() < desired:
-            self.geometry(f"{max(620, self.winfo_width())}x{desired}")
+            self.geometry(f"{max(480, self.winfo_width())}x{desired}")
 
     def show_line(
         self, quest: str, speaker: str, source: str, translation: str
     ) -> None:
+        name = self.owner.display_speaker(quest, speaker)
+        original = normalize_text(source)
+        same_line = (self.quest_var.get(), self.speaker_var.get(), self.source_var.get()) == (
+            quest, name, original
+        )
         self.quest_var.set(quest)
-        self.speaker_var.set(self.owner.display_speaker(quest, speaker))
-        self.source_var.set(normalize_text(source))
-        self.translation_var.set(normalize_text(translation) or "正在翻译…")
+        self.speaker_var.set(name)
+        self.source_var.set(original)
+        if translation:
+            self.translation_var.set(normalize_text(translation))
+        elif not (same_line and self.translation_var.get().endswith(" ▍")):
+            self.translation_var.set("正在翻译…" if self.owner.config_data.translation_enabled else "翻译已关闭")
         self.explain_button.configure(state="normal")
         self.after_idle(self._apply_wrap)
 
     def show_preview(self, quest: str, speaker: str, source: str) -> None:
-        """Paint Hook text immediately without creating a history record."""
+        """Keep a translated page readable when its rendered snapshot arrives again."""
+        if (self.quest_var.get() == quest and
+                self.speaker_var.get() == self.owner.display_speaker(quest, speaker) and
+                backlog_match_key("", self.source_var.get()) == backlog_match_key("", source)):
+            return
         self.quest_var.set(quest)
         self.speaker_var.set(self.owner.display_speaker(quest, speaker))
         self.source_var.set(normalize_text(source))
-        self.translation_var.set("正在匹配预翻译…")
+        cached = self.owner.store.cached_page_translation(quest, speaker, source)
+        waiting = "正在读取译文…" if self.owner.config_data.translation_enabled else "翻译已关闭"
+        self.translation_var.set(cached or waiting)
         # Until the 220 ms authoritative event arrives, explain_current still
         # points at the previous database row.
         self.explain_button.configure(state="disabled")
@@ -4580,6 +4709,11 @@ class BilingualOverlay(tk.Toplevel):
         self.deiconify()
         # Do not lift or force focus. All application windows use the normal
         # Windows z-order and must yield to whichever software the user selects.
+
+    def close_reader(self) -> None:
+        self.owner.config_data.show_translation_overlay = False
+        self.owner.show_main_window()
+        self.hide()
 
     def hide(self) -> None:
         self.withdraw()
@@ -5103,6 +5237,8 @@ class Application(tk.Tk):
         self.explanation_window = ExplanationWindow(self)
         if not self.config_data.show_translation_overlay:
             self.overlay.hide()
+        elif self.config_data.reader_only:
+            self.withdraw()
         self._load_history()
         self.after(8, self._poll_events)
         self.after(180, self._start_translator)
@@ -5112,6 +5248,11 @@ class Application(tk.Tk):
         style = ttk.Style(self)
         if "clam" in style.theme_names():
             style.theme_use("clam")
+        style.configure("ReaderPrimary.TButton", background="#0756AC", foreground="white",
+                        font=(UI_FONT, 9, "bold"), borderwidth=1)
+        style.map("ReaderPrimary.TButton",
+                  background=[("disabled", "#ECECF1"), ("pressed", "#063E80"), ("active", "#084C96")],
+                  foreground=[("disabled", "#65656D"), ("!disabled", "white")])
         style.configure(
             "App.Treeview",
             background=UI_CARD,
@@ -5273,7 +5414,13 @@ class Application(tk.Tk):
         ).pack(side="right", padx=8)
 
         knowledge_row = tk.Frame(controls, bg=UI_CARD)
-        knowledge_row.pack(fill="x", padx=20, pady=(0, 13))
+        def toggle_knowledge() -> None:
+            if knowledge_row.winfo_manager():
+                knowledge_row.pack_forget()
+            else:
+                knowledge_row.pack(fill="x", padx=20, pady=(0, 13))
+
+        apple_button(service_row, "术语库", toggle_knowledge, compact=True).pack(side="right", padx=8)
         tk.Label(
             knowledge_row,
             textvariable=self.knowledge_status_var,
@@ -5682,7 +5829,14 @@ class Application(tk.Tk):
         self.config_data.save()
         self.overlay.show()
 
+    def show_main_window(self) -> None:
+        self.config_data.reader_only = False
+        self.config_data.save()
+        self.deiconify()
+        self.lift()
+
     def overlay_only(self) -> None:
+        self.config_data.reader_only = True
         self.show_overlay()
         self.withdraw()
 
@@ -5774,13 +5928,14 @@ class Application(tk.Tk):
         )
         self.explanation_worker.start()
 
-    def _show_current_row(self, row_id: int) -> None:
+    def _show_current_row(self, row_id: int) -> bool:
+        """Paint the current line and report whether it still needs translation."""
         items = self.store.translation_items([row_id])
         if not items:
-            return
+            return False
         item = items[0]
         if str(item.get("status", "")) == "skipped":
-            return
+            return False
         self.current_row_id = row_id
         self.overlay.show_line(
             str(item["quest"]), str(item["speaker"]), str(item["text"]),
@@ -5788,6 +5943,7 @@ class Application(tk.Tk):
         )
         if self.config_data.show_translation_overlay and not self.log_window.is_visible():
             self.overlay.show()
+        return not bool(item["translation"])
 
     def open_settings(self) -> None:
         dialog = tk.Toplevel(self)
@@ -6172,16 +6328,19 @@ class Application(tk.Tk):
                 value for value in event.get("entries", []) if isinstance(value, dict)
             ]
             label = quest_label(event.get("quest"))
+            folded_ids: list[int] = []
             ids = self.store.add_backlog(
                 entries,
                 label,
                 captured_at,
                 self._session_anchor,
                 str(event.get("source", "ScriptBackLog.logData")),
+                folded_ids=folded_ids,
             )
+            for fragment in folded_ids:
+                if self.tree.exists(str(fragment)):
+                    self.tree.delete(str(fragment))
             self._refresh_filter_values()
-            if ids and self.translator:
-                self.translator.enqueue(ids)
             current_id = None
             if entries:
                 last_entry = entries[-1]
@@ -6191,9 +6350,11 @@ class Application(tk.Tk):
                     str(last_entry.get("text", "")),
                 )
             if current_id is not None:
-                self._show_current_row(current_id)
-                if self.translator:
+                needs_translation = self._show_current_row(current_id)
+                if self.translator and needs_translation:
                     self.translator.enqueue_current(current_id)
+            if ids and self.translator:
+                self.translator.enqueue([row for row in ids if row != current_id])
             self._update_tree_rows(ids + ([current_id] if current_id else []))
             if self.log_window.is_visible():
                 self.log_window.refresh(label)
@@ -6309,7 +6470,7 @@ class Application(tk.Tk):
                         row_id,
                         label,
                         sanitize_speaker(stored_speaker),
-                        normalize_text(text),
+                        str(stored[0]["text"]) if stored else normalize_text(text),
                         translation=stored_translation,
                         status="skipped" if skip_translation else stored_status,
                     )
@@ -6318,6 +6479,7 @@ class Application(tk.Tk):
                     self.translator
                     and not skip_translation
                     and not linked_choice
+                    and not stored_translation
                 ):
                     # A cache miss must never wait for the long Sol preload
                     # request. The currently visible page gets the dedicated
@@ -6594,6 +6756,9 @@ class Application(tk.Tk):
         self.status_var.set("历史记录已清空")
 
     def on_close(self) -> None:
+        if self.overlay.winfo_width() > 1:
+            self.config_data.reader_geometry = self.overlay.geometry()
+            self.config_data.save()
         self.knowledge_cancel.set()
         if self.explanation_worker:
             self.explanation_worker.close()
