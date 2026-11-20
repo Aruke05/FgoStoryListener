@@ -36,7 +36,7 @@ except ImportError as exc:  # pragma: no cover - packaged builds include Frida
 
 
 APP_NAME = "FGO 剧情文本监听器"
-APP_VERSION = "2.11.1"
+APP_VERSION = "2.11.2"
 PACKAGE = "com.aniplex.fategrandorder"
 GADGET_PORT = 27043
 SERVER_PORT = 27042
@@ -334,6 +334,19 @@ def backlog_match_key(speaker: str, text: str) -> tuple[str, str]:
     if clean_speaker == "【已选择】":
         clean_text = re.sub(r"^\d+\.\s*", "", clean_text)
     return clean_speaker, clean_text.replace("\n", "")
+
+
+CHOICE_VARIANT_RE = re.compile(r"\[&([^:\[\]\n]+):([^:\[\]\n]+)\]")
+
+
+def choice_display_text(raw: str) -> str | None:
+    """Keep both script wordings when the active variant is unknown."""
+    def alternatives(match: re.Match[str]) -> str:
+        first, second = match.groups()
+        return first if first == second else f"（{first}／{second}）"
+
+    expanded = CHOICE_VARIANT_RE.sub(alternatives, raw)
+    return normalize_text(expanded) if managed_text_is_lossless(expanded) else None
 
 
 def contains_japanese(value: str) -> bool:
@@ -2730,7 +2743,7 @@ class CodexAppServerClient:
             "speaker 为空时 speaker_zh 必须为空；不得给旁白、场景描写或内心文字制造人物名。"
             "zh 只填写 ja 的译文，"
             "不要擅自在译文前添加人物名或外层引号。不得漏行、合并、虚构或改变剧情事实。"
-            "保留语气、口癖、分行和选项编号；同一关卡称呼保持一致。"
+            "保留语气、口癖、分行和选项编号；选项内括号中的斜线分隔同一位置的两种措辞，同义时合译，含义不同时保留区别；同一关卡称呼保持一致。"
             "未知昵称保守翻译，不冒充官方译名。memory_updates 只记录当前台词明确证明且带证据 id 的"
             "关卡内称呼/关系/临时术语。每一轮输入的 curated_glossary 是按当前台词检索出的"
             "来源可追溯术语硬约束，character_style_guide 是人物专属口癖硬约束。"
@@ -4372,7 +4385,7 @@ class DialogueProcessor:
     def notify(self, event: dict[str, Any]) -> None:
         kind = event.get("type")
         if kind in {
-            "dialogue", "dialogue_preview", "choices", "choice_selected", "scenario_plan", "backlog"
+            "dialogue", "dialogue_preview", "choices", "choice_selected", "choice_closed", "scenario_plan", "backlog"
         }:
             self.jobs.put(dict(event))
             return
@@ -4404,6 +4417,10 @@ class DialogueProcessor:
                 break
             try:
                 kind = str(event.get("type", ""))
+                if kind == "choice_closed":
+                    self._active_choices.pop(str(event.get("dialog_id", "global")), None)
+                    self.output.put(event)
+                    continue
                 if kind == "backlog":
                     self.output.put(event)
                     continue
@@ -4443,9 +4460,9 @@ class DialogueProcessor:
                     selected = (
                         cached[index]
                         if 0 <= index < len(cached)
-                        else normalize_text(raw_text)
+                        else choice_display_text(raw_text)
                     )
-                    if not selected or not managed_text_is_lossless(raw_text):
+                    if not selected:
                         self._report_uncertain_once(str(event.get("source", "choice_selected")))
                         continue
                     resolved = dict(event)
@@ -4454,19 +4471,17 @@ class DialogueProcessor:
                     continue
                 if kind == "choices":
                     raw_choices = [str(value) for value in event.get("choices", [])]
-                    if not raw_choices or not all(
-                        managed_text_is_lossless(value) for value in raw_choices
-                    ):
+                    choices = [choice_display_text(value) or "" for value in raw_choices]
+                    if not any(choices):
                         self._report_uncertain_once(str(event.get("source", "choices")))
                         continue
-                    choices = [normalize_text(value) for value in raw_choices]
                     resolution_source = f"{event.get('source', '')}+DirectManagedText"
                     dialog_id = str(event.get("dialog_id", "global"))
                     self._active_choices[dialog_id] = choices
                     resolved = dict(event)
                     resolved.update(
                         {
-                            "choices": choices,
+                            "choices": [line or "（此项原文暂未识别）" for line in choices],
                             "raw_choices": raw_choices,
                             "source": resolution_source,
                         }
@@ -5276,6 +5291,7 @@ class Application(tk.Tk):
         self.quest_filter = tk.StringVar(value="全部关卡")
         self._fragment_rows: list[int] = []
         self._fragment_timer: str | None = None
+        self._open_choice_dialog: str | None = None
         self.current_row_id: int | None = None
         self._active_preload_quest = ""
         self._session_anchor = self.store.max_order() + 1_000_000
@@ -6322,6 +6338,7 @@ class Application(tk.Tk):
         self.worker.start()
 
     def restart_listener(self) -> None:
+        self._open_choice_dialog = None
         self._finish_fragments(set())
         if self.worker:
             self.worker.stop()
@@ -6423,6 +6440,9 @@ class Application(tk.Tk):
                     str(last_entry.get("speaker", "")),
                     str(last_entry.get("text", "")),
                 )
+            if self._open_choice_dialog is not None:
+                # The game LOG still ends on the line underneath the open menu.
+                current_id = None
             if current_id is not None:
                 self._finish_fragments({*folded_ids, current_id})
                 needs_translation = self._show_current_row(current_id)
@@ -6440,6 +6460,7 @@ class Application(tk.Tk):
                 if normalize_text(str(value))
             ]
             if choices:
+                self._open_choice_dialog = str(event.get("dialog_id", "global"))
                 text = "\n".join(f"{index + 1}. {value}" for index, value in enumerate(choices))
                 converted = dict(event)
                 converted.update(
@@ -6454,7 +6475,12 @@ class Application(tk.Tk):
                     }
                 )
                 self._handle_event(converted)
+        elif kind == "choice_closed":
+            if self._open_choice_dialog == str(event.get("dialog_id", "global")):
+                self._open_choice_dialog = None
         elif kind == "choice_selected":
+            if self._open_choice_dialog == str(event.get("dialog_id", "global")):
+                self._open_choice_dialog = None
             text = normalize_text(str(event.get("text", "")))
             index = int(event.get("index", -1) or 0)
             if text:
@@ -6472,6 +6498,8 @@ class Application(tk.Tk):
                 )
                 self._handle_event(converted)
         elif kind == "dialogue_preview":
+            if self._open_choice_dialog is not None:
+                return
             speaker = sanitize_speaker(str(event.get("speaker", "")))
             text = normalize_text(str(event.get("text", "")))
             source = str(event.get("source", ""))
@@ -6496,6 +6524,8 @@ class Application(tk.Tk):
             speaker = str(event.get("speaker", ""))
             text = str(event.get("text", ""))
             source = str(event.get("source", ""))
+            if self._open_choice_dialog is not None and source.startswith("CurrentMessageSnapshot"):
+                return
             skip_translation = bool(translation_skip_reason(speaker, text, source))
             display_order = self._next_live_order
             self._next_live_order += 10
@@ -6522,6 +6552,8 @@ class Application(tk.Tk):
                     raw_text,
                     display_order,
                 )
+            if row_id is None and speaker == "【剧情选项】":
+                row_id = self.store.latest_visible_id(label, speaker, text)
             if row_id is not None:
                 if speaker != "【剧情选项】" and speaker != "【已选择】":
                     self.store.link_preloaded_composition(row_id)
@@ -6541,7 +6573,11 @@ class Application(tk.Tk):
                 # The overlay is the latency-critical surface. Update it before
                 # touching the large database Treeview or rebuilding LOG text.
                 fragment = source.startswith("ScriptMessageCommonManager.AddText")
-                if fragment and not skip_translation:
+                behind_choice = self._open_choice_dialog is not None and speaker != "【剧情选项】"
+                if behind_choice:
+                    if self.translator and not stored_translation and not skip_translation:
+                        self.translator.enqueue([row_id])
+                elif fragment and not skip_translation:
                     self._fragment_rows.append(row_id)
                     self._wait_for_game_page()
                 elif not skip_translation:
@@ -6563,6 +6599,7 @@ class Application(tk.Tk):
                     self.translator
                     and not skip_translation
                     and not fragment
+                    and not behind_choice
                     and not linked_choice
                     and not stored_translation
                 ):
@@ -6756,6 +6793,7 @@ class Application(tk.Tk):
             self.status_var.set(str(event.get("message", "监听失败")))
             self.status_dot.configure(fg="#b23a3a")
         elif kind == "detached":
+            self._open_choice_dialog = None
             self.status_var.set("FGO 已退出或重启，等待重新连接…")
             self.status_dot.configure(fg="#d18b00")
         elif kind == "diagnostic" and event.get("level") == "error":

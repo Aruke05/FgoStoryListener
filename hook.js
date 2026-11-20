@@ -884,7 +884,9 @@ function install() {
         this.dialogId = managerKey(args[0]);
       },
       onLeave(retval) {
-        state.choicesByDialog.delete(this.dialogId);
+        if (state.choicesByDialog.delete(this.dialogId)) {
+          report('choice_closed', { dialog_id: this.dialogId });
+        }
       },
     });
 

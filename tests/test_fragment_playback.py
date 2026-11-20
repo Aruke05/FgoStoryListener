@@ -20,6 +20,7 @@ class FragmentPlaybackTests(unittest.TestCase):
         self.ui.store = self.store
         self.ui._fragment_rows = []
         self.ui._fragment_timer = None
+        self.ui._open_choice_dialog = None
         self.ui._session_anchor = self.ui._next_live_order = 1000
         self.ui.log_window.is_visible.return_value = False
         self.now = datetime.now()
