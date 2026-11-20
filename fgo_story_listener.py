@@ -36,7 +36,7 @@ except ImportError as exc:  # pragma: no cover - packaged builds include Frida
 
 
 APP_NAME = "FGO 剧情文本监听器"
-APP_VERSION = "2.11.0"
+APP_VERSION = "2.11.1"
 PACKAGE = "com.aniplex.fategrandorder"
 GADGET_PORT = 27043
 SERVER_PORT = 27042
@@ -950,6 +950,18 @@ class HistoryStore:
                 "CREATE INDEX dialogue_page_lookup ON dialogue(quest, speaker, text) WHERE page_id IS NULL"
             )
 
+        if not self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='dialogue_playback_order'"
+        ).fetchone():
+            self._db.execute(
+                "CREATE INDEX dialogue_playback_order ON dialogue(captured_at, id) "
+                "WHERE preloaded=0 AND page_id IS NULL"
+            )
+            for page, quest, speaker, text in self._db.execute(
+                "SELECT id,quest,speaker,text FROM reading_dialogue WHERE source='ScriptBackLog.logData' "
+                "ORDER BY captured_at,id"
+            ).fetchall():
+                self._fold_live_fragments(page, quest, speaker, text)
         self._db.commit()
 
     def _snapshot_page(self, before_id: int, quest: str, speaker: str, text: str) -> int | None:
@@ -968,10 +980,12 @@ class HistoryStore:
         self._db.executemany("UPDATE dialogue SET page_id=? WHERE id=?",
                              [(page, fragment) for fragment in fragments])
         marks = ",".join("?" for _ in fragments)
-        translated = self._db.execute(
-            f"SELECT translation, translation_model, translation_updated_at FROM dialogue "
-            f"WHERE id IN ({marks}) ORDER BY id", fragments,
+        rows = self._db.execute(
+            f"SELECT id,translation,translation_model,translation_updated_at FROM dialogue "
+            f"WHERE id IN ({marks})", fragments,
         ).fetchall()
+        by_id = {row[0]: row[1:] for row in rows}
+        translated = [by_id[row_id] for row_id in fragments]
         if all(row[0] for row in translated):
             self._db.execute(
                 "UPDATE dialogue SET translation=?, translation_model=?, translation_status='done', "
@@ -990,13 +1004,29 @@ class HistoryStore:
             ).fetchall()
         return str(rows[0][0]) if len(rows) == 1 else ""
 
-    def _fold_live_fragments(self, page: int, quest: str, speaker: str, text: str) -> list[int]:
+    def _fold_live_fragments(self, page: int, quest: str, speaker: str, text: str,
+                             played_ids: list[int] | None = None) -> list[int]:
         remaining = backlog_match_key(speaker, text)[1]
         fragments = []
-        for row_id, stage, name, line, source in self._db.execute(
-            "SELECT id,quest,speaker,text,source FROM reading_dialogue "
-            "WHERE preloaded=0 AND id < ? ORDER BY id DESC LIMIT 32", (page,),
-        ):
+        if played_ids:
+            # Active preloads keep their old IDs; even timestamps may tie.
+            # The UI received these callbacks in their exact playback order.
+            ids = played_ids[-32:]
+            marks = ",".join("?" for _ in ids)
+            rows = self._db.execute(
+                f"SELECT id,quest,speaker,text,source FROM reading_dialogue WHERE id IN ({marks})",
+                ids,
+            ).fetchall()
+            by_id = {row[0]: row for row in rows}
+            candidates = [by_id[i] for i in reversed(ids) if i in by_id]
+        else:
+            candidates = self._db.execute(
+                "SELECT id,quest,speaker,text,source FROM reading_dialogue "
+                "WHERE preloaded=0 AND (captured_at,id) < "
+                "(SELECT captured_at,id FROM dialogue WHERE id=?) "
+                "ORDER BY captured_at DESC,id DESC LIMIT 32", (page,),
+            )
+        for row_id, stage, name, line, source in candidates:
             if (stage != quest or name != speaker or not source.startswith(
                     ("ScriptMessageCommonManager.AddText", "ScriptMessageCommonManager.SetText",
                      "CurrentMessageSnapshot"))):
@@ -1007,8 +1037,12 @@ class HistoryStore:
             fragments.append(row_id)
             remaining = remaining[:-len(part)]
             if not remaining:
+                fragments.reverse()
                 self._fold_rows(page, fragments)
                 return fragments
+        if played_ids:
+            # A long pause can publish the fallback before the rest of the page arrives.
+            return self._fold_live_fragments(page, quest, speaker, text)
         return []
 
     def add(
@@ -1378,6 +1412,7 @@ class HistoryStore:
         before_order: int,
         source: str = "ScriptBackLog.logData",
         folded_ids: list[int] | None = None,
+        played_ids: list[int] | None = None,
     ) -> list[int]:
         clean: list[tuple[str, str]] = []
         for entry in entries:
@@ -1495,6 +1530,12 @@ class HistoryStore:
                 if row_id is None:
                     continue
                 activated_any = True
+                folded = self._fold_live_fragments(
+                    row_id, clean_quest, speaker, text, played_ids if index == n - 1 else None,
+                )
+                if folded_ids is not None:
+                    folded_ids.extend(folded)
+                self._db.commit()
                 translated = self._db.execute(
                     "SELECT translation FROM dialogue WHERE id = ?", (row_id,)
                 ).fetchone()
@@ -1594,7 +1635,9 @@ class HistoryStore:
                 inserted_ids[index] = row_id
                 ids.append(row_id)
                 self.link_preloaded_composition(row_id)
-                folded = self._fold_live_fragments(row_id, clean_quest, speaker, text)
+                folded = self._fold_live_fragments(
+                    row_id, clean_quest, speaker, text, played_ids if index == n - 1 else None,
+                )
                 if folded_ids is not None:
                     folded_ids.extend(folded)
 
@@ -4329,7 +4372,7 @@ class DialogueProcessor:
     def notify(self, event: dict[str, Any]) -> None:
         kind = event.get("type")
         if kind in {
-            "dialogue", "dialogue_preview", "choices", "choice_selected", "scenario_plan"
+            "dialogue", "dialogue_preview", "choices", "choice_selected", "scenario_plan", "backlog"
         }:
             self.jobs.put(dict(event))
             return
@@ -4361,6 +4404,9 @@ class DialogueProcessor:
                 break
             try:
                 kind = str(event.get("type", ""))
+                if kind == "backlog":
+                    self.output.put(event)
+                    continue
                 if kind == "scenario_plan":
                     entries: list[dict[str, str]] = []
                     for value in event.get("entries", [])[:4096]:
@@ -4568,14 +4614,14 @@ class BilingualOverlay(tk.Toplevel):
         self.header = tk.Frame(self.card, bg=UI_CARD)
         self.header.pack(fill="x", padx=20, pady=(16, 8))
         self.quest_var = tk.StringVar(value="等待剧情文本…")
-        tk.Label(
+        quest_label = tk.Label(
             self.header,
             textvariable=self.quest_var,
             bg=UI_CARD,
             fg=UI_SECONDARY,
             font=(UI_FONT, 9),
             anchor="w",
-        ).pack(side="left", fill="x", expand=True)
+        )
         apple_button(self.header, "主窗口", owner.show_main_window, compact=True).pack(side="right")
         self.log_button = apple_button(
             self.header, "查看 LOG", owner.show_log, compact=True
@@ -4586,6 +4632,7 @@ class BilingualOverlay(tk.Toplevel):
         )
         self.explain_button.configure(state="disabled")
         self.explain_button.pack(side="right")
+        quest_label.pack(side="left", fill="x", expand=True)
 
         self.speaker_var = tk.StringVar(value="")
         self.speaker_label = tk.Label(
@@ -5227,6 +5274,8 @@ class Application(tk.Tk):
         # default. The game-style LOG continues to show played rows only.
         self.show_preloaded_rows = tk.BooleanVar(value=True)
         self.quest_filter = tk.StringVar(value="全部关卡")
+        self._fragment_rows: list[int] = []
+        self._fragment_timer: str | None = None
         self.current_row_id: int | None = None
         self._active_preload_quest = ""
         self._session_anchor = self.store.max_order() + 1_000_000
@@ -5928,6 +5977,30 @@ class Application(tk.Tk):
         )
         self.explanation_worker.start()
 
+    def _wait_for_game_page(self) -> None:
+        # AddText fires as the typewriter reveals chunks. Give AddLog its
+        # 320 ms debounce plus scheduling headroom before displaying fallback text.
+        if self._fragment_timer is not None:
+            self.after_cancel(self._fragment_timer)
+        self._fragment_timer = self.after(600, self._show_fragment_fallback)
+
+    def _finish_fragments(self, covered: set[int]) -> None:
+        if self._fragment_timer is not None:
+            self.after_cancel(self._fragment_timer)
+            self._fragment_timer = None
+        remaining = [row for row in self._fragment_rows if row not in covered]
+        self._fragment_rows.clear()
+        if remaining and self.translator:
+            self.translator.enqueue(remaining)
+
+    def _show_fragment_fallback(self) -> None:
+        self._fragment_timer = None
+        if self._fragment_rows:
+            current = self._fragment_rows[-1]
+            self._finish_fragments({current})
+            if self._show_current_row(current) and self.translator:
+                self.translator.enqueue_current(current)
+
     def _show_current_row(self, row_id: int) -> bool:
         """Paint the current line and report whether it still needs translation."""
         items = self.store.translation_items([row_id])
@@ -6249,6 +6322,7 @@ class Application(tk.Tk):
         self.worker.start()
 
     def restart_listener(self) -> None:
+        self._finish_fragments(set())
         if self.worker:
             self.worker.stop()
             self.worker.join(timeout=2)
@@ -6335,7 +6409,7 @@ class Application(tk.Tk):
                 captured_at,
                 self._session_anchor,
                 str(event.get("source", "ScriptBackLog.logData")),
-                folded_ids=folded_ids,
+                folded_ids=folded_ids, played_ids=self._fragment_rows,
             )
             for fragment in folded_ids:
                 if self.tree.exists(str(fragment)):
@@ -6350,6 +6424,7 @@ class Application(tk.Tk):
                     str(last_entry.get("text", "")),
                 )
             if current_id is not None:
+                self._finish_fragments({*folded_ids, current_id})
                 needs_translation = self._show_current_row(current_id)
                 if self.translator and needs_translation:
                     self.translator.enqueue_current(current_id)
@@ -6400,6 +6475,10 @@ class Application(tk.Tk):
             speaker = sanitize_speaker(str(event.get("speaker", "")))
             text = normalize_text(str(event.get("text", "")))
             source = str(event.get("source", ""))
+            if source.startswith("ScriptMessageCommonManager.AddText"):
+                if self._fragment_rows:
+                    self._wait_for_game_page()
+                return
             if (
                 text
                 and not translation_skip_reason(speaker, text, source)
@@ -6461,7 +6540,12 @@ class Application(tk.Tk):
                 stored_speaker = str(stored[0]["speaker"]) if stored else speaker
                 # The overlay is the latency-critical surface. Update it before
                 # touching the large database Treeview or rebuilding LOG text.
-                if not skip_translation:
+                fragment = source.startswith("ScriptMessageCommonManager.AddText")
+                if fragment and not skip_translation:
+                    self._fragment_rows.append(row_id)
+                    self._wait_for_game_page()
+                elif not skip_translation:
+                    self._finish_fragments({row_id})
                     self._show_current_row(row_id)
                 self._refresh_filter_values()
                 selected = self.quest_filter.get()
@@ -6478,6 +6562,7 @@ class Application(tk.Tk):
                 if (
                     self.translator
                     and not skip_translation
+                    and not fragment
                     and not linked_choice
                     and not stored_translation
                 ):
@@ -6633,7 +6718,7 @@ class Application(tk.Tk):
             )
             if self.log_window.is_visible() and played_changed:
                 self.log_window.refresh()
-            if self.current_row_id is not None:
+            if self.current_row_id in row_details:
                 self._show_current_row(self.current_row_id)
             failed = len(event.get("failed_ids", []))
             failed_ids = [int(value) for value in event.get("failed_ids", [])]
@@ -6756,6 +6841,7 @@ class Application(tk.Tk):
         self.status_var.set("历史记录已清空")
 
     def on_close(self) -> None:
+        self._finish_fragments(set())
         if self.overlay.winfo_width() > 1:
             self.config_data.reader_geometry = self.overlay.geometry()
             self.config_data.save()

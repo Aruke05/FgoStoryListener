@@ -19,7 +19,7 @@ class ReadingExperienceTests(unittest.TestCase):
 
     def log(self, lines, folded=None):
         return self.store.add_backlog(
-            [{"speaker": "A", "text": line} for line in lines], "序章", self.now, 1000,
+            [{"speaker": "A", "text": line} for line in lines], "序章", self.now + timedelta(seconds=2), 1000,
             folded_ids=folded,
         )
 
