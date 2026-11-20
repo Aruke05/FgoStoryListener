@@ -61,3 +61,17 @@ class BlueStacksBridgeTests(unittest.TestCase):
         command = root.call_args.args[0]
         self.assertIn(f'if [ "$(readlink /proc/321/exe)" = {app.REMOTE_ARM64_SERVER} ]', command)
         self.assertIn("then kill 321", command)
+
+    def test_attach_retries_when_forward_opens_before_server_is_ready(self):
+        bridge = self.make_bridge()
+        bridge._native_address = "127.0.0.1:48731"
+        with (
+            patch.object(app.frida, "get_device_manager") as manager,
+            patch.object(bridge.detached_event, "wait", return_value=False),
+        ):
+            device = manager.return_value.add_remote_device.return_value
+            session = Mock()
+            device.attach.side_effect = [app.frida.TransportError("connection closed"), session]
+            bridge.attach_hook(42)
+            self.assertEqual(device.attach.call_args_list, [call(42), call(42)])
+            session.create_script.return_value.load.assert_called_once_with()

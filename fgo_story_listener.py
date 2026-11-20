@@ -36,7 +36,7 @@ except ImportError as exc:  # pragma: no cover - packaged builds include Frida
 
 
 APP_NAME = "FGO 剧情文本监听器"
-APP_VERSION = "2.10.0"
+APP_VERSION = "2.10.1"
 PACKAGE = "com.aniplex.fategrandorder"
 GADGET_PORT = 27043
 SERVER_PORT = 27042
@@ -4119,7 +4119,7 @@ class EmulatorBridge:
                 try:
                     session = device.attach(pid)
                     break
-                except frida.ServerNotRunningError as exc:
+                except (frida.ServerNotRunningError, frida.TransportError) as exc:
                     if time.monotonic() >= deadline or self.detached_event.wait(0.25):
                         detail = self.adb_device(
                             ["shell", "cat", "/data/local/tmp/fgo-story-listener-frida.log"],
@@ -5070,6 +5070,8 @@ class Application(tk.Tk):
         # Every FGO listener window deliberately uses normal Windows z-order.
         self.attributes("-topmost", False)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        if sys.platform == "darwin":
+            self.tk.createcommand("::tk::mac::Quit", self.on_close)
         self.store = HistoryStore(data_dir() / "history.db")
         self.config_data = RuntimeConfig.load()
         self.knowledge = KnowledgeBase(

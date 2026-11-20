@@ -5,7 +5,11 @@
 实时读取日服 FGO 的剧情台词、人物名、选项与游戏 LOG，使用本机已登录的
 `codex-cli` 生成中文译文，并保存为可筛选、复制和导出的双语历史记录。
 
-当前版本 **v2.10.0**
+当前版本 **v2.10.1**
+
+### v2.10.1 修复 BlueStacks Air 启动连接
+
+- 当 ADB 转发先于监听服务就绪时自动重试，并支持通过 macOS 的退出菜单关闭监听。
 
 ### v2.10.0 支持 BlueStacks Air
 
@@ -112,7 +116,7 @@ python .\fgo_story_listener.py
 # 单元测试
 python -m unittest discover -s tests -v
 
-# 生成 dist-v2.10.0\FgoStoryListener
+# 生成 dist-v2.10.1\FgoStoryListener
 .\build.ps1
 ```
 
