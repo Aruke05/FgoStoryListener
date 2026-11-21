@@ -15,6 +15,7 @@ class FragmentPlaybackTests(unittest.TestCase):
         self.store = HistoryStore(Path(temp.name) / "history.db")
         self.addCleanup(self.store.close)
         self.ui = Mock()
+        self.ui._stage_token = None
         for name in ("_finish_fragments", "_wait_for_game_page", "_show_fragment_fallback", "_show_current_row"):
             setattr(self.ui, name, getattr(Application, name).__get__(self.ui))
         self.ui.store = self.store

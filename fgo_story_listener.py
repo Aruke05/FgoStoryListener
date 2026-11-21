@@ -28,6 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from fgo_knowledge import KnowledgeBase, KnowledgeUpdater, KnowledgeUpdateError
+import stage_plan
 
 try:
     import frida
@@ -36,7 +37,7 @@ except ImportError as exc:  # pragma: no cover - packaged builds include Frida
 
 
 APP_NAME = "FGO 剧情文本监听器"
-APP_VERSION = "2.11.2"
+APP_VERSION = "2.11.2-stage1"
 PACKAGE = "com.aniplex.fategrandorder"
 GADGET_PORT = 27043
 SERVER_PORT = 27042
@@ -676,6 +677,9 @@ class HistoryStore:
             "translation_updated_at": "TEXT NOT NULL DEFAULT ''",
             "preloaded": "INTEGER NOT NULL DEFAULT 0",
             "page_id": "INTEGER",
+            "stage_key": "TEXT NOT NULL DEFAULT ''",
+            "stage_prior": "TEXT NOT NULL DEFAULT '[]'",
+            "stage_active": "INTEGER NOT NULL DEFAULT 1",
         }
         for name, definition in translation_columns.items():
             if name not in columns:
@@ -834,8 +838,9 @@ class HistoryStore:
         # ScriptManager.MessageGroups.
         self._db.execute(
             "DELETE FROM dialogue WHERE preloaded = 1 "
-            "AND source LIKE 'ScriptManager.executeDataList%'"
+            "AND (source LIKE 'ScriptManager.executeDataList%' OR source LIKE 'ScriptManager.VisibleTextSlots%')"
         )
+        self._db.execute("UPDATE dialogue SET stage_active=0 WHERE preloaded=1 AND stage_key<>''")
         # Combat skill labels and fixed title-screen notices are useful as
         # diagnostics, but are not scenario dialogue. Keep them in history
         # while permanently excluding them from AI queues and context.
@@ -1010,10 +1015,17 @@ class HistoryStore:
     def cached_page_translation(self, quest: str, speaker: str, text: str) -> str:
         """Preview only an unambiguous completed translation for this exact line."""
         with self._lock:
+            args = (quest, sanitize_speaker(speaker), normalize_text(text))
+            checked = self._db.execute(
+                "SELECT DISTINCT translation FROM reading_dialogue WHERE quest=? AND speaker=? "
+                "AND text=? AND preloaded=1 AND stage_key<>'' AND stage_active=1 LIMIT 2", args
+            ).fetchall()
+            if checked:
+                return str(checked[0][0]) if len(checked)==1 else ""
             rows = self._db.execute(
                 "SELECT DISTINCT translation FROM reading_dialogue "
-                "WHERE quest=? AND speaker=? AND text=? AND translation<>'' LIMIT 2",
-                (quest, sanitize_speaker(speaker), normalize_text(text)),
+                "WHERE quest=? AND speaker=? AND text=? AND (preloaded=0 OR stage_active=1) "
+                "AND translation<>'' LIMIT 2", args,
             ).fetchall()
         return str(rows[0][0]) if len(rows) == 1 else ""
 
@@ -1181,6 +1193,12 @@ class HistoryStore:
             ).fetchone()
             return int(row[0])
 
+    def suspend_verified_plan(self) -> None:
+        """Retain cache material but never activate an unverified previous session/phase."""
+        with self._lock:
+            self._db.execute("UPDATE dialogue SET stage_active=0 WHERE preloaded=1 AND stage_key<>'' AND stage_active=1")
+            self._db.commit()
+
     def add_preloaded(
         self,
         entries: list[dict[str, Any]],
@@ -1189,7 +1207,7 @@ class HistoryStore:
         source: str = "ScriptManager.AnalysScript+Preload",
     ) -> tuple[list[int], int]:
         """Stage a whole scenario invisibly while retaining reusable translations."""
-        clean: list[tuple[str, str]] = []
+        clean: list[tuple[str, str, str, str]] = []
         for entry in entries[:4096]:
             speaker = sanitize_speaker(str(entry.get("speaker", "")))
             text = normalize_text(str(entry.get("text", "")))
@@ -1198,7 +1216,8 @@ class HistoryStore:
                 and text.strip().lower() != "select"
                 and not translation_skip_reason(speaker, text, source)
             ):
-                clean.append((speaker, text))
+                clean.append((speaker, text, str(entry.get("stage_key", "")),
+                              json.dumps(entry.get("prior", []), ensure_ascii=False)))
         if not clean:
             return [], 0
         clean_quest = normalize_text(quest) or "未知关卡"
@@ -1214,6 +1233,14 @@ class HistoryStore:
                 value = (str(translation), str(model), str(status), str(updated))
                 cached.setdefault((str(speaker), str(text)), value)
                 text_only.setdefault(str(text), value)
+            verified_cache = {
+                (key, sp, ja, prior): (zh, model, status, updated)
+                for key, sp, ja, prior, zh, model, status, updated in self._db.execute(
+                    "SELECT stage_key,speaker,text,stage_prior,translation,translation_model,"
+                    "translation_status,translation_updated_at FROM dialogue WHERE quest=? "
+                    "AND stage_key<>'' AND translation<>'' ORDER BY id", (clean_quest,)
+                )
+            } if source == stage_plan.SOURCE else {}
             self._db.execute(
                 "DELETE FROM dialogue WHERE quest = ? AND preloaded = 1", (clean_quest,)
             )
@@ -1228,10 +1255,12 @@ class HistoryStore:
                 ).fetchone()[0]
             )
             pending: list[int] = []
-            for index, (speaker, text) in enumerate(clean):
+            for index, (speaker, text, key, prior) in enumerate(clean):
                 old = cached.get((speaker, text))
                 if old is None and not speaker:
                     old = text_only.get(text)
+                if source == stage_plan.SOURCE:
+                    old = verified_cache.get((key, speaker, text, prior))
                 old = old or ("", "", "", "")
                 translation, model, status, updated = old
                 if translation:
@@ -1242,8 +1271,8 @@ class HistoryStore:
                     (captured_at, display_order, quest, speaker, text,
                      raw_speaker, raw_text, source, translation,
                      translation_model, translation_status,
-                     translation_updated_at, preloaded)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                     translation_updated_at, preloaded, stage_key, stage_prior)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                     """,
                     (
                         captured_at.isoformat(timespec="milliseconds"),
@@ -1258,6 +1287,8 @@ class HistoryStore:
                         model,
                         status,
                         updated,
+                        key,
+                        prior,
                     ),
                 )
                 row_id = int(cur.lastrowid)
@@ -1273,7 +1304,7 @@ class HistoryStore:
             self._db.execute(
                 "SELECT id, speaker, text, translation, translation_model, "
                 "translation_status, translation_updated_at FROM dialogue "
-                "WHERE preloaded = 1 AND quest = ? ORDER BY display_order, id",
+                "WHERE preloaded = 1 AND stage_key='' AND quest = ? ORDER BY display_order, id",
                 (quest,),
             )
         )
@@ -1352,9 +1383,10 @@ class HistoryStore:
         with self._lock:
             row = self._db.execute(
                 "SELECT id FROM dialogue WHERE preloaded = 1 AND quest = ? AND text = ? "
+                "AND stage_active=1 AND (stage_key='' OR speaker=?) "
                 "ORDER BY CASE WHEN speaker = ? THEN 0 WHEN speaker = '' THEN 1 ELSE 2 END, "
                 "display_order, id LIMIT 1",
-                (clean_quest, clean_text, clean_speaker),
+                (clean_quest, clean_text, clean_speaker, clean_speaker),
             ).fetchone()
             if not row:
                 # The parsed script stores visible screen lines separately,
@@ -1578,6 +1610,25 @@ class HistoryStore:
                     speaker_repairs,
                 )
 
+            # On replay the exact old LOG row can already exist. Prefer the
+            # verified translation only for the currently displayed LOG tail,
+            # and only if the real preceding speakers and wording also match.
+            if n >= 2 and n-1 in matched:
+                tail_id = int(global_rows[matched[n-1]][0])
+                candidates = self._db.execute(
+                    "SELECT stage_key,stage_prior,translation,translation_model,translation_updated_at "
+                    "FROM dialogue WHERE preloaded=1 AND stage_active=1 AND stage_key<>'' "
+                    "AND quest=? AND speaker=? AND text=? AND translation<>'' LIMIT 2",
+                    (clean_quest, *clean[-1]),
+                ).fetchall()
+                if len(candidates)==1 and stage_plan.matches_prior(json.loads(candidates[0][1]), clean[:-1]):
+                    self._db.execute(
+                        "UPDATE dialogue SET stage_key=?, stage_prior=?, translation=?, translation_model=?, "
+                        "translation_updated_at=?, translation_status='done' WHERE id=? AND stage_key<>?",
+                        (*candidates[0], tail_id, candidates[0][0]),
+                    )
+                    self._db.commit()
+
             missing = [index for index in range(n) if index not in matched]
             if not missing:
                 if speaker_repairs:
@@ -1732,8 +1783,8 @@ class HistoryStore:
                 "EXISTS(SELECT 1 FROM choice_translation_link link "
                 "JOIN dialogue source ON source.id = link.choice_row_id "
                 "WHERE link.selected_row_id = d.id AND source.translation = '' "
-                "AND source.translation_status <> 'error') FROM reading_dialogue d "
-                f"WHERE d.id IN ({placeholders}) ORDER BY d.display_order, d.id",
+                "AND source.translation_status <> 'error'), d.stage_prior FROM reading_dialogue d "
+                f"WHERE d.id IN ({placeholders}) AND (d.preloaded=0 OR d.stage_active=1) ORDER BY d.display_order, d.id",
                 tuple(row_ids),
             ).fetchall()
         return [
@@ -1747,6 +1798,7 @@ class HistoryStore:
                 "status": str(row[6]),
                 "preloaded": bool(row[7]),
                 "choice_waiting": bool(row[8]),
+                "stage_prior": json.loads(row[9]),
             }
             for row in rows
         ]
@@ -1775,7 +1827,7 @@ class HistoryStore:
             return [
                 int(row[0])
                 for row in self._db.execute(
-                    "SELECT id FROM reading_dialogue WHERE quest = ? AND preloaded = 1 "
+                    "SELECT id FROM reading_dialogue WHERE quest = ? AND preloaded = 1 AND stage_active=1 "
                     "AND translation = '' AND translation_status NOT IN ('translating', 'skipped') "
                     "ORDER BY display_order, id LIMIT ?",
                     (quest, limit),
@@ -1786,7 +1838,7 @@ class HistoryStore:
         """Return hidden pending rows only for the most recently staged scenario."""
         with self._lock:
             row = self._db.execute(
-                "SELECT quest FROM reading_dialogue WHERE preloaded = 1 "
+                "SELECT quest FROM reading_dialogue WHERE preloaded = 1 AND stage_active=1 "
                 "ORDER BY captured_at DESC, id DESC LIMIT 1"
             ).fetchone()
         if not row:
@@ -3047,6 +3099,15 @@ class CodexTranslationWorker(threading.Thread):
             for item in batch
         ]
         payload: dict[str, Any] = {"lines_to_translate": lines}
+        for line,item in zip(lines,batch):
+            if item.get("stage_prior"):
+                line["preceding_script_pages"] = item["stage_prior"]
+        if any("preceding_script_pages" in line for line in lines):
+            payload["context_note"] = (
+                "preceding_script_pages 是剧本明确标名的紧邻前文，不要翻译或输出这些上下文页。"
+                "候选措辞尚未确定。遇到称呼、玩笑和回嘴时，先根据前文分清是谁称呼谁、"
+                "谁在对谁说，再按对话关系译，不擅自补出与前文相反的施受关系。"
+            )
         is_preload = any(bool(item.get("preloaded")) for item in batch)
         if is_preload:
             payload["scenario_preload_mode"] = True
@@ -4437,6 +4498,7 @@ class DialogueProcessor:
                         raw_text = str(value.get("text", ""))
                         raw_speaker = str(value.get("speaker", ""))
                         if not managed_text_is_lossless(raw_text):
+                            entries.append({"text": "\ufffc", "speaker": ""})
                             continue
                         if raw_speaker and not managed_text_is_lossless(raw_speaker):
                             raw_speaker = ""
@@ -4448,6 +4510,7 @@ class DialogueProcessor:
                         )
                     if entries:
                         resolved = dict(event)
+                        resolved["type"] = "scenario_lookup"
                         resolved["entries"] = entries
                         resolved["source"] = f"{event.get('source', '')}+DirectManagedText"
                         self.output.put(resolved)
@@ -5294,6 +5357,7 @@ class Application(tk.Tk):
         self._open_choice_dialog: str | None = None
         self.current_row_id: int | None = None
         self._active_preload_quest = ""
+        self._stage_token = None
         self._session_anchor = self.store.max_order() + 1_000_000
         self._next_live_order = self._session_anchor
         self._build_ui()
@@ -6338,6 +6402,8 @@ class Application(tk.Tk):
         self.worker.start()
 
     def restart_listener(self) -> None:
+        self._stage_token = None
+        self.store.suspend_verified_plan()
         self._open_choice_dialog = None
         self._finish_fragments(set())
         if self.worker:
@@ -6359,6 +6425,10 @@ class Application(tk.Tk):
 
     def _handle_event(self, event: dict[str, Any]) -> None:
         kind = event.get("type")
+        if kind in {"backlog","dialogue","dialogue_preview","choices"} and self._stage_token:
+            if quest_label(event.get("quest")) != self._stage_token[0]:
+                self._stage_token = None
+                self.store.suspend_verified_plan()
         if kind == "status":
             self.status_var.set(str(event.get("text", "")))
             self.status_dot.configure(fg="#2d9b55" if event.get("ready") else "#d18b00")
@@ -6368,7 +6438,24 @@ class Application(tk.Tk):
             suffix = f"，已读取游戏 LOG {backlog_count} 条" if backlog_count else ""
             self.status_var.set(f"监听中（{hooks} 个 Hook{suffix}）")
             self.status_dot.configure(fg="#2d9b55")
+        elif kind == "scenario_lookup":
+            if not (self.config_data.translation_enabled and self.config_data.pretranslate_scenario):
+                return
+            token = (quest_label(event.get("quest")), uuid.uuid4().hex)
+            self._stage_token = token
+            self.store.suspend_verified_plan()
+            def lookup():
+                try:
+                    pages = stage_plan.resolve(event.get("quest"), event["entries"], normalize_text)
+                except Exception:
+                    # A bad/missing optional catalog must not stop the live reader.
+                    pages = []
+                self.events.put(dict(event, type="scenario_plan", token=token,
+                                     source=stage_plan.SOURCE, entries=pages))
+            threading.Thread(target=lookup, name="FgoStageLookup", daemon=True).start()
         elif kind == "scenario_plan":
+            if event.get("token") != self._stage_token or event.get("source") != stage_plan.SOURCE:
+                return
             if not (
                 self.config_data.translation_enabled
                 and self.config_data.pretranslate_scenario
@@ -6383,6 +6470,9 @@ class Application(tk.Tk):
             entries = [
                 value for value in event.get("entries", []) if isinstance(value, dict)
             ]
+            if not entries:
+                self.status_var.set("未核实到本段完整剧本页，按游戏实际显示翻译")
+                return
             pending_ids, total = self.store.add_preloaded(
                 entries,
                 label,
@@ -6409,8 +6499,8 @@ class Application(tk.Tk):
                 self._update_count()
             cached = total - len(pending_ids)
             self.status_var.set(
-                f"已读取完整剧情脚本 {total} 个片段：缓存命中 {cached}，"
-                f"后台预翻译 {len(pending_ids)}（安全预算内整关单批，超限每批 100）"
+                f"已核实 {total} 页：缓存 {cached}，后台预翻 {len(pending_ids)}；"
+                "动态及未核实内容随实际显示翻译"
             )
         elif kind == "backlog":
             timestamp_ms = int(event.get("captured_at_ms", 0) or 0)

@@ -1,6 +1,8 @@
 # FGO 剧情文本监听器
 
-FgoStoryListener v2.11.2 在模拟器旁显示日服 FGO 的日文台词、剧情选项和简体中文译文，并将双语记录保存在本机。
+FgoStoryListener v2.11.2-stage1（本地改进版）在模拟器旁显示日服 FGO 的日文台词、剧情选项和简体中文译文，并将双语记录保存在本机。
+
+开启整关预翻译后，程序在后台按关卡 ID、阶段从 Atlas Academy 查询日服剧本，不上传游戏 LOG 或译文。只预翻能和本机文字顺序唯一对应、有明确姓名的完整页；动态称呼、选项、含未知指令的页面、离线或剧本不匹配的情况沿用实时翻译。已核实的前文可作为上下文，不替玩家选择变量。关闭整关预翻译也会关闭这次公开剧本查询。
 
 ## 开始使用
 
@@ -47,4 +49,4 @@ python -m venv .venv
 .\build.ps1
 ```
 
-macOS 产物在 `dist-macos/`，Windows 产物在 `dist-v2.11.2/`。使用虚拟环境中的 Python 运行 `python -m unittest discover -s tests -v` 可执行测试。
+macOS 产物在 `dist-macos/`，Windows 产物在 `dist-v2.11.2-stage1/`。使用虚拟环境中的 Python 运行 `python -m unittest discover -s tests -v` 可执行测试。手动运行 `python tests/smoke_stage_online.py` 可用真实剧本与已配置模型重放卑弥呼用例；测试使用临时数据库。
