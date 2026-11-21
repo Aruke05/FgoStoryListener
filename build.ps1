@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $Project = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Dist = Join-Path $Project 'dist-v2.11.2-stage3'
+$Dist = Join-Path $Project 'dist-v2.11.2'
 $VenvPython = Join-Path $Project '.venv\Scripts\python.exe'
 $Vendor = Join-Path $Project '.tools\fgo-listener'
 $Python = if (Test-Path -LiteralPath $VenvPython) {
