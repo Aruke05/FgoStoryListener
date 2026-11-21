@@ -37,7 +37,7 @@ class StagePlanTests(unittest.TestCase):
                                  quest=Q,entries=[dict(s,kind="dialogue_fragment") for s in SLOTS]))
                 lookup=events.get(timeout=2)
                 self.assertEqual(lookup["type"],"scenario_lookup")
-                with patch.object(sp,"resolve",side_effect=lambda q,s,n:sp.aligned_pages(SCRIPT,s,n,"id")):
+                with patch.object(sp,"resolve",side_effect=lambda q,s,n,**kwargs:sp.aligned_pages(SCRIPT,s,n,"id")):
                     f.Application._handle_event(ui,lookup)
                     ready=events.get(timeout=2)
                 f.Application._handle_event(ui,ready)

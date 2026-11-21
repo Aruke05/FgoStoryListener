@@ -9,7 +9,25 @@ from urllib.request import Request, urlopen
 SOURCE = "AtlasJP.VerifiedPages.v1"
 VARIANT = re.compile(r"\[&([^:\[\]\n]+):([^:\[\]\n]+)\]")
 NAME = re.compile(r"[ぁ-ヿ一-鿿々Ａ-Ｚａ-ｚA-Za-z０-９0-9・＆ ]{1,60}")
-PAGE = re.compile(r"^＠([^\n]*)\n((?:(?![＠＄＊？?\[])[^\n]+\n)+)\[k\][ \t]*$", re.M)
+SLOT_NAME = re.compile(r"[A-ZＡ-Ｚ][：:]([^：:]+)")
+
+def nameplate(header):
+    """Only parse an explicit display name. A lone stage slot is not a name."""
+    header = header.strip()
+    tagged = SLOT_NAME.fullmatch(header)
+    value = (tagged[1] if tagged else header).strip()
+    if (not value or len(value)>60 or re.fullmatch(r"[A-ZＡ-Ｚ]",value)
+            or not re.fullmatch(r"[\w々〆・＆！？ー、&'’〜～＝=／/（）() .\-]+",value)):
+        return None
+    return value, bool(tagged or not NAME.fullmatch(value))
+PAGE = re.compile(r"^＠([^\n]*)\n((?:(?![＠＄＊？?]|\[k\])[^\n]+\n)+)\[k\][ \t]*$", re.M)
+# Only directives with audited, presentation-only arguments. Unknown commands
+# remain in the string and disqualify the page; never strip arbitrary tags.
+FX = re.compile(r"\[(?:wt \d+(?:\.\d+)?|charaFace [A-Z] \d+|charaFaceFade [A-Z] \d+ \d+(?:\.\d+)?|charaMoveReturn [A-Z] -?\d+,-?\d+ \d+(?:\.\d+)?)\]")
+SHAKE = re.compile(r"\[messageShake(?: \d+(?:\.\d+)?){4}\]")
+# Candidate-only: numeric presentation commands in known visual/audio families.
+# Never strip arbitrary tags, branch selectors, variable names or Japanese text.
+PRESENTATION = re.compile(r"\[(?:camera[A-Z][A-Za-z]*|chara(?:Move|Fade|Face|Scale|Put)[A-Za-z]*|messageShake[A-Za-z]*|(?:bgm|se|cueSe)Stop)(?: +(?:[A-Z]|[-+]?\d+(?:\.\d+)?(?:,[-+]?\d+(?:\.\d+)?)*)){1,10}\]")
 BREAK = re.compile(r"(?im)^\s*(?:[＠＊？?＄]|\[(?:label|select\w*|branch\w*|goto\w*|jump\w*|if\w*)\b)")
 def matches_prior(expected, observed):
     """Require adjacent played pages, including an exact materialized variant, not fuzzy text."""
@@ -28,13 +46,13 @@ def matches_prior(expected, observed):
 
 @lru_cache(maxsize=24)
 def _get(url):
-    with urlopen(Request(url, headers={"User-Agent": "FgoStoryListener/2.11.2-stage1"}), timeout=5) as r:
+    with urlopen(Request(url, headers={"User-Agent": "FgoStoryListener/2.11.2-stage3"}), timeout=5) as r:
         data = r.read(2_000_001)
     if len(data) > 2_000_000:
         raise ValueError("Script response too large")
     return data.decode("utf-8-sig")
 
-def aligned_pages(raw, slots, normalize, sid):
+def aligned_pages(raw, slots, normalize, sid, audit=None):
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     parts = [v["text"].replace("\n", "") for v in slots]
     combined = "".join(parts)
@@ -44,11 +62,30 @@ def aligned_pages(raw, slots, normalize, sid):
         pos += len(p)
         bounds.add(pos)
     candidates = []
+    pages = []
+    log_only = set()
     for m in PAGE.finditer(raw):
-        speaker, body = m[1].strip(), normalize(m[2])
-        # Explicit simple name plate only. No aliases, macros or inferred carry-over.
-        if not NAME.fullmatch(speaker) or not body or len(body) > 2400:
+        name = nameplate(m[1])
+        literal = SHAKE.sub("", FX.sub("", m[2]))
+        font_only = "[f large]" in literal
+        literal = literal.replace("[f large]", "")
+        body = normalize(PRESENTATION.sub("", literal))
+        if audit is not None:
+            # For diagnostics only. Never use stripped unknown directives to
+            # generate a translation or activate a cache hit.
+            probe = normalize(re.sub(r"\[[^\[\]]+\]", "", body))
+            if probe:
+                why = ("unknown_name" if name is None else
+                       "dynamic" if VARIANT.search(body) else
+                       "markup" if "[" in body or "]" in body else "not_unique_or_unaligned")
+                audit.setdefault(probe,why)
+            for v in (1,2):
+                if VARIANT.search(body): audit[VARIANT.sub(lambda m:m[v],body)]="dynamic"
+        if name is None or not body or len(body) > 2400:
             continue
+        speaker, strict = name
+        if strict or font_only or SHAKE.search(m[2]) or PRESENTATION.search(literal):
+            log_only.add(m.start())
         skeleton = VARIANT.sub("", body)
         if any(c in skeleton for c in "[]＠＄") or any(c in body for c in "{}"):
             continue
@@ -56,30 +93,46 @@ def aligned_pages(raw, slots, normalize, sid):
             continue
         needle = skeleton.replace("\n", "")
         if not needle: continue
+        pages.append((m,speaker,body,needle))
         i = combined.find(needle)
         if i < 0 or i not in bounds or i+len(needle) not in bounds or combined.find(needle, i+1) >= 0:
             continue
         candidates.append((i, i+len(needle), m, speaker, body, needle))
-    counts = Counter(row[-1] for row in candidates)
+    counts = Counter(row[-1] for row in pages)
+    named_counts = Counter((row[1],row[-1]) for row in pages)
     candidates = [r for r in candidates if counts[r[-1]] == 1]
     if any(a[1] > b[0] for a,b in zip(candidates,candidates[1:])):
         return []
+    # Several distinct ordered anchors identify this script. Its unambiguous
+    # named static pages are useful as candidates even outside the anchors;
+    # never present one until the game's own LOG confirms the full name/text.
+    anchors = {m.start():(start,end) for start,end,m,sp,body,needle in candidates}
+    strong = [m.start() for _,_,m,sp,body,needle in candidates
+              if len(needle)>=8 and not VARIANT.search(body)]
     out, history = [], []
-    prev = None
+    prev = prev_slot_end = None
     digest = hashlib.sha256(raw.encode()).hexdigest()
-    for start,end,m,speaker,body,_ in candidates:
-        if not prev or start != prev[0] or BREAK.search(raw[prev[1]:m.start()]):
+    for m,speaker,body,needle in pages:
+        direct = m.start() in anchors
+        warm = (not direct and len(strong)>=3 and named_counts[speaker,needle]==1
+                and not VARIANT.search(body))
+        if not direct and not warm:
+            history, prev, prev_slot_end = [], None, None
+            continue
+        if (prev is None or BREAK.search(raw[prev:m.start()]) or
+                (direct and prev_slot_end is not None and anchors[m.start()][0] != prev_slot_end)):
             history = []
         dynamic = bool(VARIANT.search(body))
         if not dynamic:
             out.append(dict(speaker=speaker, text=body,
-                            stage_key=f"{sid}:{digest}:{m.start()}",
+                            stage_key=f"{sid}:{digest}:{m.start()}" + (":log" if warm or m.start() in log_only else ""),
                             prior=history[-2:]))
         history = (history + [dict(speaker=speaker, ja=VARIANT.sub(r"（候选：\1／\2）",body))])[-2:]
-        prev = (end,m.end())
+        prev = m.end()
+        prev_slot_end = anchors[m.start()][1] if direct else None
     return out
 
-def resolve(quest, slots, normalize, fetch=_get):
+def resolve(quest, slots, normalize, fetch=_get, *, diagnostics=None):
     if not isinstance(quest,dict): return []
     q,p = str(quest.get("quest_id","")),str(quest.get("phase",""))
     if not re.fullmatch(r"[1-9]\d{0,9}",q) or not re.fullmatch(r"[1-9]\d?",p) or not slots: return []
@@ -94,7 +147,11 @@ def resolve(quest, slots, normalize, fetch=_get):
     matches=[]
     for sid in sorted(ids):
         raw=fetch(f"https://static.atlasacademy.io/JP/Script/{sid[:2]}/{sid[:4]}/{sid}.txt")
-        plan=aligned_pages(raw,slots,normalize,sid)
+        detail={} if diagnostics is not None else None
+        plan=aligned_pages(raw,slots,normalize,sid,detail)
         if len(plan) >= 2:
-            matches.append(plan)
-    return matches[0] if len(matches)==1 else []
+            matches.append((plan,detail))
+    if len(matches)!=1: return []
+    plan,detail=matches[0]
+    if diagnostics is not None: diagnostics.update(detail)
+    return plan
